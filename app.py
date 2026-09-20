@@ -207,7 +207,7 @@ def baixar_frame(sessao: requests.Session, t: dt.datetime,
 # No IMERG V07 o HDF5 traz os dados no grupo /Grid, com 'precipitation' em
 # (time, lon, lat) e _FillValue = -9999.9.
 def ler_frame(caminho: Path) -> xr.DataArray:
-    ds = xr.open_dataset(caminho, group="Grid", engine="h5netcdf")
+    ds = xr.open_dataset(caminho, group="Grid", engine="h5netcdf", decode_times=False)
     nome = "precipitation" if "precipitation" in ds else "precipitationCal"
     da = ds[nome].isel(time=0)
     if "lat" in da.dims and "lon" in da.dims:
@@ -624,7 +624,7 @@ def ler_goes(caminho: Path, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
     Por isso aplica-se uma média de bloco antes de amostrar, aproximando a
     área que o IMERG integra.
     """
-    ds = xr.open_dataset(caminho, engine="h5netcdf")
+    ds = xr.open_dataset(caminho, engine="h5netcdf", decode_times=False)
     campo = ds["RRQPE"]
 
     LA, LO = np.meshgrid(lats, lons, indexing="ij")
