@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 import requests
 import xarray as xr
+try:
+    import h5py  # noqa: F401 — backend HDF5 usado por h5netcdf
+except ImportError as exc:
+    raise RuntimeError(
+        "Dependência ausente: h5py. Instale as dependências de requirements.txt e reinicie o aplicativo."
+    ) from exc
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import (gaussian_filter, generic_filter,
                            map_coordinates, uniform_filter)
