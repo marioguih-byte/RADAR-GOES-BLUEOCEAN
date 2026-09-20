@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import io
 import re
 import sys
 import threading
 import traceback
 import unicodedata
 from pathlib import Path
+
+from PIL import Image
 import io
 import numpy as np
 import pandas as pd
@@ -936,8 +939,8 @@ def _map_fig(r, q, zoom_deg):
         )
 
     proj = ccrs.PlateCarree()
-    fig = plt.figure(figsize=(12.8, 7.0), dpi=130, facecolor="white")
-    ax = fig.add_axes([0.055, 0.075, 0.79, 0.82], projection=proj)
+    fig = plt.figure(figsize=(9.2, 5.1), dpi=100, facecolor="white")
+    ax = fig.add_axes([0.060, 0.105, 0.755, 0.78], projection=proj)
     ax.set_facecolor("white")
     ax.set_extent(
         [lon0 - zoom_deg, lon0 + zoom_deg, lat0 - zoom_deg, lat0 + zoom_deg],
@@ -1040,7 +1043,7 @@ def _map_fig(r, q, zoom_deg):
         zorder=8,
     )
 
-    cax = fig.add_axes([0.865, 0.16, 0.022, 0.66])
+    cax = fig.add_axes([0.845, 0.17, 0.024, 0.62])
     cbar = fig.colorbar(pcm, cax=cax, extend="max")
     cbar.set_label("Precipitação (mm/h)", fontsize=9.5, color="#2f2f2f")
     cbar.ax.tick_params(labelsize=8.5, colors="#3f3f3f", length=3)
@@ -1053,6 +1056,45 @@ def _map_fig(r, q, zoom_deg):
         spine.set_linewidth(0.8)
 
     return fig
+
+def _fig_bytes(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+def _build_gif(r, quadros, zoom_deg, duration_ms=500):
+    frames = []
+    for q in quadros:
+        img_bytes = _fig_bytes(_map_fig(r, q, zoom_deg))
+        frames.append(Image.open(io.BytesIO(img_bytes)).convert("P", palette=Image.Palette.ADAPTIVE, colors=128))
+    if not frames:
+        return None
+    out = io.BytesIO()
+    frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
+    return out.getvalue()
+
+def _show_gif(gif_bytes):
+    if not gif_bytes:
+        return
+    import base64
+    b64 = base64.b64encode(gif_bytes).decode("ascii")
+    st.markdown(
+        f'<div style="display:flex;justify-content:center;width:100%;">'
+        f'<img src="data:image/gif;base64,{b64}" style="width:900px;max-width:100%;height:auto;border:1px solid #d0d0d0;border-radius:8px;" />'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 def _table_df(r):
     blocos = []
@@ -1313,6 +1355,7 @@ if consultar:
         st.session_state["quadros"] = _build_frames(resultado)
         st.session_state["indice_quadro"] = 0
         st.session_state["zoom"] = 4.0
+        st.session_state["gif_bytes"] = None
         progress.progress(1.0, text="Concluído")
         status_box.success("Consulta concluída.")
     except Exception as e:
@@ -1359,28 +1402,14 @@ st.caption(
 
 quadros = st.session_state.get("quadros", _build_frames(r))
 if quadros:
-    n = len(quadros)
-    idx = int(
-        st.slider(
-            "Linha do tempo",
-            min_value=0,
-            max_value=max(n - 1, 0),
-            value=min(st.session_state.get("indice_quadro", 0), max(n - 1, 0)),
-            step=1,
-            format="%d",
-        )
+    st.session_state.setdefault("visualizacao", "GIF (padrão)")
+    vis = st.radio(
+        "Visualização do mapa",
+        ["GIF (padrão)", "Imagem por imagem"],
+        index=0 if st.session_state.get("visualizacao", "GIF (padrão)") == "GIF (padrão)" else 1,
+        horizontal=True,
     )
-    st.session_state["indice_quadro"] = idx
-
-    nav1, nav2, nav3 = st.columns([1, 1, 8])
-    with nav1:
-        if st.button("◀", use_container_width=True):
-            st.session_state["indice_quadro"] = max(idx - 1, 0)
-            st.rerun()
-    with nav2:
-        if st.button("▶", use_container_width=True):
-            st.session_state["indice_quadro"] = min(idx + 1, n - 1)
-            st.rerun()
+    st.session_state["visualizacao"] = vis
 
     zoom = st.number_input(
         "Zoom do mapa (°)",
@@ -1390,7 +1419,43 @@ if quadros:
     )
     st.session_state["zoom"] = zoom
 
-    q = quadros[st.session_state["indice_quadro"]]
+    if vis == "GIF (padrão)":
+        gif = st.session_state.get("gif_bytes")
+        if gif is None or st.session_state.get("gif_zoom") != float(zoom):
+            with st.spinner("Montando animação GIF..."):
+                gif = _build_gif(r, quadros, float(zoom), duration_ms=500)
+            st.session_state["gif_bytes"] = gif
+            st.session_state["gif_zoom"] = float(zoom)
+        _show_gif(gif)
+        st.caption(
+            f"Animação automática · {len(quadros)} quadros · intervalo de 0,5 s · "
+            f"zoom {float(zoom):.1f}°"
+        )
+    else:
+        n = len(quadros)
+        idx = int(
+            st.slider(
+                "Linha do tempo",
+                min_value=0,
+                max_value=max(n - 1, 0),
+                value=min(st.session_state.get("indice_quadro", 0), max(n - 1, 0)),
+                step=1,
+                format="%d",
+            )
+        )
+        st.session_state["indice_quadro"] = idx
+
+        nav1, nav2, nav3 = st.columns([1, 1, 8])
+        with nav1:
+            if st.button("◀", use_container_width=True):
+                st.session_state["indice_quadro"] = max(idx - 1, 0)
+                st.rerun()
+        with nav2:
+            if st.button("▶", use_container_width=True):
+                st.session_state["indice_quadro"] = min(idx + 1, n - 1)
+                st.rerun()
+
+    q = quadros[st.session_state.get("indice_quadro", 0)]
     fig = _map_fig(r, q, float(zoom))
 else:
     st.warning("Nenhum quadro espacial foi produzido.")
@@ -1400,7 +1465,9 @@ tab_mapa, tab_tabela, tab_log = st.tabs(["🗺️ Mapa", "📋 Tabela", "🧾 Lo
 
 with tab_mapa:
     if fig is not None:
-        st.pyplot(fig, clear_figure=False, use_container_width=True)
+        left, center, right = st.columns([1, 8, 1])
+        with center:
+            st.pyplot(fig, clear_figure=False, use_container_width=False)
 
         q = quadros[st.session_state["indice_quadro"]]
         local = q["tempo_utc"] + TZ_LOCAL

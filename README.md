@@ -1,13 +1,19 @@
+# RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
+Aplicação Streamlit para monitoramento de precipitação com IMERG Early Run, GOES-19 RRQPEF, nowcast lagrangiano e previsão numérica pontual.
 
-### Correção do erro `No module named h5py`
+## Interface
+- Tema geral do Streamlit em preto.
+- Mapa meteorológico com Cartopy e fundo branco.
+- Mapa reduzido e centralizado na tela.
+- Visualização padrão em GIF animado.
+- Alternativa de visualização quadro a quadro com linha do tempo e botões de navegação.
 
-O IMERG/GOES é lido como HDF5 por meio do `h5netcdf`, que utiliza o `h5py`. O `requirements.txt` já inclui `h5py>=3.15,<4`, compatível com Python 3.14. Em serviços como o Streamlit Cloud, depois de atualizar os arquivos, faça um novo deploy/reinício do app para que as dependências sejam reinstaladas.
+## Dependências
+O `requirements.txt` inclui h5py, cftime, Cartopy e Pillow para leitura dos arquivos HDF5/netCDF e geração do GIF.
 
-### Correção para arquivos IMERG/GOES com calendário juliano
-
-A leitura dos HDF5 é feita com `decode_times=False`, pois os carimbos temporais dos produtos não são usados para extrair o campo espacial. Isso evita que o xarray tente interpretar o calendário `julian` durante a abertura do arquivo. `cftime` também permanece nas dependências como suporte adicional para outros arquivos com calendários não padrão.
-
-### Mapa
-
-O mapa web usa Matplotlib + Cartopy, com fundo branco, costa, fronteiras internacionais, divisas estaduais, grade de latitude/longitude e barra de cores de precipitação.
+## Execução
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
