@@ -831,10 +831,10 @@ def coletar_dia(unidade: str, lat: float, lon: float, *, latencia_h: float,
 
 import io
 import streamlit as st
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 
 st.set_page_config(
-    page_title="Petrobras — Precipitação",
+    page_title="RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES",
     page_icon="🌧️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -917,7 +917,7 @@ def _build_frames(r):
 
 def _map_fig(r, q, zoom_deg):
     campo = q["campo"]
-    lat0, lon0 = r["lat"], r["lon"]
+    lat0, lon0 = float(r["lat"]), float(r["lon"])
 
     recorte = campo.sel(
         lat=slice(lat0 - zoom_deg, lat0 + zoom_deg),
@@ -926,87 +926,132 @@ def _map_fig(r, q, zoom_deg):
 
     z = np.asarray(recorte.values, dtype=float)
     z = np.where(np.isfinite(z), z, np.nan)
+    lats = np.asarray(recorte.lat.values, dtype=float)
+    lons = np.asarray(recorte.lon.values, dtype=float)
 
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Heatmap(
-            x=np.asarray(recorte.lon.values),
-            y=np.asarray(recorte.lat.values),
-            z=z,
-            zmin=0,
-            zmax=25,
-            colorscale="Turbo",
-            colorbar={"title": "mm/h"},
-            hovertemplate="Lon %{x:.3f}°<br>Lat %{y:.3f}°<br>%{z:.2f} mm/h<extra></extra>",
+    if not TEM_CARTOPY:
+        raise RuntimeError(
+            "Cartopy não está instalado. Adicione cartopy ao requirements.txt "
+            "e reinicie o aplicativo."
         )
+
+    proj = ccrs.PlateCarree()
+    fig = plt.figure(figsize=(12.8, 7.0), dpi=130, facecolor="white")
+    ax = fig.add_axes([0.055, 0.075, 0.79, 0.82], projection=proj)
+    ax.set_facecolor("white")
+    ax.set_extent(
+        [lon0 - zoom_deg, lon0 + zoom_deg, lat0 - zoom_deg, lat0 + zoom_deg],
+        crs=proj,
     )
 
-    # Unidade.
-    fig.add_trace(
-        go.Scatter(
-            x=[lon0],
-            y=[lat0],
-            mode="markers",
-            marker={
-                "symbol": "triangle-up",
-                "size": 13,
-                "color": "white",
-                "line": {"color": "black", "width": 1},
-            },
-            name="Unidade",
-            hovertemplate=f"{r['unidade']}<br>{lat0:.4f}, {lon0:.4f}<extra></extra>",
-        )
+    # Base cartográfica: limpa, branca e com referências geográficas sutis.
+    ax.add_feature(cfeature.OCEAN, facecolor="white", edgecolor="none", zorder=0)
+    ax.add_feature(cfeature.LAND, facecolor="#fafafa", edgecolor="none", zorder=0.1)
+    ax.add_feature(
+        cfeature.LAKES, facecolor="white", edgecolor="#b8b8b8", linewidth=0.35, zorder=0.2
+    )
+    ax.add_feature(
+        cfeature.BORDERS, edgecolor="#8d8d8d", linewidth=0.65, zorder=4
+    )
+    ax.add_feature(
+        cfeature.STATES, edgecolor="#b7b7b7", linewidth=0.45, zorder=4
+    )
+    ax.coastlines(resolution="50m", color="#444444", linewidth=0.8, zorder=4.2)
+
+    # Campo de precipitação.
+    pcm = ax.pcolormesh(
+        lons,
+        lats,
+        z,
+        transform=proj,
+        cmap="turbo",
+        vmin=0,
+        vmax=25,
+        shading="auto",
+        alpha=0.92,
+        zorder=2,
     )
 
-    # Círculo de influência.
-    ang = np.linspace(0, 2 * np.pi, 180)
-    dlat = r["raio_km"] / 111.0
-    dlon = r["raio_km"] / (111.0 * max(np.cos(np.deg2rad(lat0)), 1e-6))
-    fig.add_trace(
-        go.Scatter(
-            x=lon0 + dlon * np.cos(ang),
-            y=lat0 + dlat * np.sin(ang),
-            mode="lines",
-            line={"color": "white", "width": 2},
-            name=f"Raio {r['raio_km']:.0f} km",
-            hoverinfo="skip",
-        )
+    # Unidade Petrobras.
+    ax.scatter(
+        lon0,
+        lat0,
+        transform=proj,
+        marker="^",
+        s=85,
+        facecolor="white",
+        edgecolor="black",
+        linewidth=1.45,
+        zorder=7,
     )
 
+    # Raio de influência.
+    ang = np.linspace(0, 2 * np.pi, 240)
+    dlat = float(r["raio_km"]) / 111.0
+    dlon = float(r["raio_km"]) / (111.0 * max(np.cos(np.deg2rad(lat0)), 1e-6))
+    ax.plot(
+        lon0 + dlon * np.cos(ang),
+        lat0 + dlat * np.sin(ang),
+        transform=proj,
+        color="black",
+        linewidth=1.5,
+        linestyle="-",
+        alpha=0.9,
+        zorder=6,
+    )
+
+    # Grade geográfica com rótulos limpos.
+    gl = ax.gridlines(
+        crs=proj,
+        draw_labels=True,
+        linewidth=0.45,
+        color="#9d9d9d",
+        alpha=0.65,
+        linestyle="--",
+        x_inline=False,
+        y_inline=False,
+    )
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {"size": 9, "color": "#3a3a3a"}
+    gl.ylabel_style = {"size": 9, "color": "#3a3a3a"}
+    gl.xformatter = LongitudeFormatter(number_format=".0f", degree_symbol="°")
+    gl.yformatter = LatitudeFormatter(number_format=".0f", degree_symbol="°")
+
+    # Título e identificação.
     local = q["tempo_utc"] + TZ_LOCAL
-    cor = {"previsto": "#b30000", "observado GOES": "#0a6b3d"}.get(
-        q["tipo"], "#00366b"
+    tipo = q["tipo"].upper()
+    titulo = f"{r['unidade']}"
+    subtitulo = f"{local:%d/%m/%Y %H:%M} local  •  {tipo}"
+    fig.text(0.45, 0.962, titulo, ha="center", va="top", fontsize=15.5, fontweight="bold", color="#1f1f1f")
+    fig.text(0.45, 0.932, subtitulo, ha="center", va="top", fontsize=9.5, color="#5b5b5b")
+
+    # Identificação do ponto e do raio.
+    ax.text(
+        0.015,
+        0.025,
+        f"Unidade  •  {lat0:.4f}, {lon0:.4f}\nRaio de análise: {r['raio_km']:.0f} km",
+        transform=ax.transAxes,
+        fontsize=8.2,
+        color="#333333",
+        va="bottom",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.45", "facecolor": "white", "edgecolor": "#bdbdbd", "alpha": 0.92},
+        zorder=8,
     )
 
-    fig.update_layout(
-        title={
-            "text": f"{r['unidade']}<br><sup>{local:%d/%m %H:%M} local — {q['tipo'].upper()}</sup>",
-            "x": 0.5,
-            "font": {"color": cor},
-        },
-        template="plotly_white",
-        margin={"l": 20, "r": 20, "t": 72, "b": 20},
-        height=620,
-        showlegend=False,
-        uirevision="mapa",
-    )
-    fig.update_xaxes(
-        title="Longitude (°)",
-        range=[lon0 - zoom_deg, lon0 + zoom_deg],
-        showgrid=True,
-        gridcolor="rgba(80,80,80,.18)",
-        zeroline=False,
-    )
-    fig.update_yaxes(
-        title="Latitude (°)",
-        range=[lat0 - zoom_deg, lat0 + zoom_deg],
-        showgrid=True,
-        gridcolor="rgba(80,80,80,.18)",
-        zeroline=False,
-        scaleanchor="x",
-        scaleratio=1,
-    )
+    cax = fig.add_axes([0.865, 0.16, 0.022, 0.66])
+    cbar = fig.colorbar(pcm, cax=cax, extend="max")
+    cbar.set_label("Precipitação (mm/h)", fontsize=9.5, color="#2f2f2f")
+    cbar.ax.tick_params(labelsize=8.5, colors="#3f3f3f", length=3)
+    cbar.outline.set_edgecolor("#999999")
+    cbar.outline.set_linewidth(0.6)
+
+    # Moldura discreta para dar acabamento ao mapa.
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#666666")
+        spine.set_linewidth(0.8)
+
     return fig
 
 def _table_df(r):
@@ -1131,7 +1176,7 @@ def _log_text(r):
 # ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
-st.title("🌧️ Petrobras — Monitoramento de precipitação")
+st.title("🌧️ RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES")
 st.caption(
     "IMERG Early Run + GOES-19 RRQPEF + nowcast lagrangiano + previsão numérica pontual."
 )
@@ -1355,19 +1400,7 @@ tab_mapa, tab_tabela, tab_log = st.tabs(["🗺️ Mapa", "📋 Tabela", "🧾 Lo
 
 with tab_mapa:
     if fig is not None:
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={
-                "displaylogo": False,
-                "scrollZoom": True,
-                "toImageButtonOptions": {
-                    "format": "png",
-                    "filename": "precipitacao_unidade",
-                    "scale": 2,
-                },
-            },
-        )
+        st.pyplot(fig, clear_figure=False, use_container_width=True)
 
         q = quadros[st.session_state["indice_quadro"]]
         local = q["tempo_utc"] + TZ_LOCAL
@@ -1413,19 +1446,15 @@ with download1:
 
 with download2:
     if fig is not None:
-        try:
-            png_bytes = fig.to_image(format="png", scale=2)
-            st.download_button(
-                "⬇️ Baixar PNG do mapa",
-                data=png_bytes,
-                file_name="precipitacao_mapa.png",
-                mime="image/png",
-                use_container_width=True,
-            )
-        except Exception:
-            st.caption(
-                "Para habilitar PNG, mantenha o pacote `kaleido` instalado."
-            )
+        png_buffer = io.BytesIO()
+        fig.savefig(png_buffer, format="png", dpi=220, facecolor="white", bbox_inches="tight")
+        st.download_button(
+            "⬇️ Baixar PNG do mapa",
+            data=png_buffer.getvalue(),
+            file_name="precipitacao_mapa.png",
+            mime="image/png",
+            use_container_width=True,
+        )
 
 st.caption(
     "IMERG é estimativa observada; o nowcast é extrapolação do campo e não substitui "

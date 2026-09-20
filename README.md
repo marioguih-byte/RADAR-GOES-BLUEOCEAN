@@ -7,3 +7,7 @@ O IMERG/GOES é lido como HDF5 por meio do `h5netcdf`, que utiliza o `h5py`. O `
 ### Correção para arquivos IMERG/GOES com calendário juliano
 
 A leitura dos HDF5 é feita com `decode_times=False`, pois os carimbos temporais dos produtos não são usados para extrair o campo espacial. Isso evita que o xarray tente interpretar o calendário `julian` durante a abertura do arquivo. `cftime` também permanece nas dependências como suporte adicional para outros arquivos com calendários não padrão.
+
+### Mapa
+
+O mapa web usa Matplotlib + Cartopy, com fundo branco, costa, fronteiras internacionais, divisas estaduais, grade de latitude/longitude e barra de cores de precipitação.
