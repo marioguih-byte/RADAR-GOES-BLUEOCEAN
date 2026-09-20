@@ -31,31 +31,22 @@ Abra o endereço mostrado pelo Streamlit.
 
 ## NASA PPS
 
-O IMERG Early Run do código original usa autenticação do NASA PPS.
+O IMERG Early Run usa autenticação do NASA PPS. O e-mail cadastrado está definido diretamente na configuração interna do aplicativo e **não é exibido na interface do site**.
 
 Cadastre o e-mail em:
 
 https://registration.pps.eosdis.nasa.gov/registration/
 
-Na aplicação, informe esse e-mail no campo lateral **E-mail NASA PPS (NRT)**.
-
-### Para publicar sem deixar o e-mail no código
-
-No Streamlit Community Cloud, em **Settings > Secrets**, coloque:
-
-```toml
-EMAIL_PPS = "seu-email-cadastrado-no-pps@dominio.com"
-```
-
-O campo já aparecerá preenchido quando o site iniciar.
+A interface não solicita nem mostra a credencial ao usuário.
 
 ## Deploy no Streamlit Community Cloud
 
 1. Crie um repositório no GitHub.
 2. Envie `app.py`, `requirements.txt` e este `README.md`.
 3. No Streamlit Community Cloud, selecione o repositório e o arquivo `app.py`.
-4. Configure `EMAIL_PPS` em **Secrets**.
-5. Publique.
+4. Publique.
+
+O e-mail PPS permanece definido internamente em `app.py` e não aparece na interface. Como ele fica gravado no código, um repositório público também o tornará visível para quem acessar o código-fonte.
 
 ## Observações técnicas
 

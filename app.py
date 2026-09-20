@@ -8,8 +8,6 @@ import traceback
 import unicodedata
 from pathlib import Path
 import io
-import os
-
 import numpy as np
 import pandas as pd
 import requests
@@ -49,7 +47,7 @@ except ImportError:
 # Cadastro gratuito e imediato em:
 #     https://registration.pps.eosdis.nasa.gov/registration/
 # No PPS o usuário E a senha são o próprio e-mail cadastrado.
-EMAIL_PPS = os.getenv("EMAIL_PPS", "")
+EMAIL_PPS = "marioguih@gmail.com"
 BASE_PPS = "https://jsimpsonhttps.pps.eosdis.nasa.gov"
 BASE_GESDISC = "https://gpm1.gesdisc.eosdis.nasa.gov/data/GPM_L3/GPM_3IMERGHHE.07"
 # domínio de trabalho: cobre de Belém (-1,4°) a Canoas (-29,9°) com margem
@@ -870,12 +868,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def _cfg_email():
-    try:
-        return str(st.secrets.get("EMAIL_PPS", "")).strip()
-    except Exception:
-        return os.getenv("EMAIL_PPS", "").strip()
-
 def _unidades():
     def chave(u):
         return unicodedata.normalize("NFKD", u[0]).encode(
@@ -1141,17 +1133,6 @@ st.caption(
 with st.sidebar:
     st.header("Consulta")
 
-    email_default = _cfg_email()
-    email_pps = st.text_input(
-        "E-mail NASA PPS (NRT)",
-        value=email_default,
-        type="default",
-        help=(
-            "O PPS usa o e-mail cadastrado como usuário e senha. "
-            "Para publicação, prefira configurar EMAIL_PPS nos Secrets do Streamlit."
-        ),
-    ).strip()
-
     unidades = _unidades()
     nomes = [u[0] for u in unidades]
     busca = st.text_input("Buscar unidade", placeholder="Digite parte do nome...")
@@ -1247,12 +1228,6 @@ with st.sidebar:
 # Execução
 # ----------------------------------------------------------------------------
 if consultar:
-    if not email_pps or "@" not in email_pps:
-        st.error(
-            "Informe o e-mail cadastrado no NASA PPS para acessar o IMERG Early Run."
-        )
-        st.stop()
-
     progress = st.progress(0, text="Iniciando...")
     status_box = st.empty()
 
@@ -1280,7 +1255,7 @@ if consultar:
                 cadencia_goes=int(cadencia_goes),
                 progresso=progresso_web,
                 cancelar=None,
-                email_pps=email_pps,
+                email_pps=EMAIL_PPS,
             )
 
         st.session_state["resultado"] = resultado
