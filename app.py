@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import re
+import zipfile
 import sys
 import threading
 import traceback
@@ -832,7 +833,6 @@ def coletar_dia(unidade: str, lat: float, lon: float, *, latencia_h: float,
 # INTERFACE WEB — STREAMLIT
 # ============================================================================
 
-import io
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -1091,10 +1091,23 @@ def _show_gif(gif_bytes):
     b64 = base64.b64encode(gif_bytes).decode("ascii")
     st.markdown(
         f'<div style="display:flex;justify-content:center;width:100%;">'
-        f'<img src="data:image/gif;base64,{b64}" style="width:900px;max-width:100%;height:auto;border:1px solid #d0d0d0;border-radius:8px;" />'
+        f'<img src="data:image/gif;base64,{b64}" style="width:760px;max-width:92%;height:auto;border:1px solid #d0d0d0;border-radius:8px;" />'
         f'</div>',
         unsafe_allow_html=True,
     )
+
+def _build_frames_zip(r, quadros, zoom_deg):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, q in enumerate(quadros, 1):
+            img_bytes = _fig_bytes(_map_fig(r, q, zoom_deg))
+            local = q["tempo_utc"] + TZ_LOCAL
+            stamp = local.strftime("%Y%m%d_%H%M")
+            tipo = re.sub(r"[^A-Za-z0-9_-]+", "_", str(q.get("tipo", "quadro"))).strip("_")
+            nome = f"quadro_{i:03d}_{stamp}_{tipo}.png"
+            zf.writestr(nome, img_bytes)
+    out.seek(0)
+    return out.getvalue()
 
 def _table_df(r):
     blocos = []
@@ -1402,15 +1415,6 @@ st.caption(
 
 quadros = st.session_state.get("quadros", _build_frames(r))
 if quadros:
-    st.session_state.setdefault("visualizacao", "GIF (padrão)")
-    vis = st.radio(
-        "Visualização do mapa",
-        ["GIF (padrão)", "Imagem por imagem"],
-        index=0 if st.session_state.get("visualizacao", "GIF (padrão)") == "GIF (padrão)" else 1,
-        horizontal=True,
-    )
-    st.session_state["visualizacao"] = vis
-
     zoom = st.number_input(
         "Zoom do mapa (°)",
         min_value=1.0, max_value=20.0,
@@ -1419,61 +1423,24 @@ if quadros:
     )
     st.session_state["zoom"] = zoom
 
-    if vis == "GIF (padrão)":
-        gif = st.session_state.get("gif_bytes")
-        if gif is None or st.session_state.get("gif_zoom") != float(zoom):
-            with st.spinner("Montando animação GIF..."):
-                gif = _build_gif(r, quadros, float(zoom), duration_ms=500)
-            st.session_state["gif_bytes"] = gif
-            st.session_state["gif_zoom"] = float(zoom)
-        _show_gif(gif)
-        st.caption(
-            f"Animação automática · {len(quadros)} quadros · intervalo de 0,5 s · "
-            f"zoom {float(zoom):.1f}°"
-        )
-    else:
-        n = len(quadros)
-        idx = int(
-            st.slider(
-                "Linha do tempo",
-                min_value=0,
-                max_value=max(n - 1, 0),
-                value=min(st.session_state.get("indice_quadro", 0), max(n - 1, 0)),
-                step=1,
-                format="%d",
-            )
-        )
-        st.session_state["indice_quadro"] = idx
-
-        nav1, nav2, nav3 = st.columns([1, 1, 8])
-        with nav1:
-            if st.button("◀", use_container_width=True):
-                st.session_state["indice_quadro"] = max(idx - 1, 0)
-                st.rerun()
-        with nav2:
-            if st.button("▶", use_container_width=True):
-                st.session_state["indice_quadro"] = min(idx + 1, n - 1)
-                st.rerun()
-
-    q = quadros[st.session_state.get("indice_quadro", 0)]
-    fig = _map_fig(r, q, float(zoom))
+    gif = st.session_state.get("gif_bytes")
+    if gif is None or st.session_state.get("gif_zoom") != float(zoom):
+        with st.spinner("Montando animação GIF..."):
+            gif = _build_gif(r, quadros, float(zoom), duration_ms=500)
+        st.session_state["gif_bytes"] = gif
+        st.session_state["gif_zoom"] = float(zoom)
 else:
+    gif = None
     st.warning("Nenhum quadro espacial foi produzido.")
-    fig = None
 
 tab_mapa, tab_tabela, tab_log = st.tabs(["🗺️ Mapa", "📋 Tabela", "🧾 Log"])
 
 with tab_mapa:
-    if fig is not None:
-        left, center, right = st.columns([1, 8, 1])
-        with center:
-            st.pyplot(fig, clear_figure=False, use_container_width=False)
-
-        q = quadros[st.session_state["indice_quadro"]]
-        local = q["tempo_utc"] + TZ_LOCAL
+    if gif is not None:
+        _show_gif(gif)
         st.caption(
-            f"Quadro {st.session_state['indice_quadro'] + 1}/{len(quadros)} · "
-            f"{local:%d/%m/%Y %H:%M} local · {q['tipo']}"
+            f"Animação automática · {len(quadros)} quadros · intervalo de 0,5 s · "
+            f"zoom {float(zoom):.1f}°"
         )
 
 with tab_tabela:
@@ -1512,17 +1479,21 @@ with download1:
     )
 
 with download2:
-    if fig is not None:
-        png_buffer = io.BytesIO()
-        fig.savefig(png_buffer, format="png", dpi=220, facecolor="white", bbox_inches="tight")
+    if quadros:
+        with st.spinner("Preparando ZIP com todas as figuras..."):
+            zip_bytes = _build_frames_zip(r, quadros, float(zoom))
         st.download_button(
-            "⬇️ Baixar PNG do mapa",
-            data=png_buffer.getvalue(),
-            file_name="precipitacao_mapa.png",
-            mime="image/png",
+            "⬇️ Baixar todas as figuras (ZIP)",
+            data=zip_bytes,
+            file_name="figuras_precipitacao.zip",
+            mime="application/zip",
             use_container_width=True,
         )
 
+st.caption(
+    "IMERG é estimativa observada; o nowcast é extrapolação do campo e não substitui "
+    "previsão numérica em horizontes longos."
+)
 st.caption(
     "IMERG é estimativa observada; o nowcast é extrapolação do campo e não substitui "
     "previsão numérica em horizontes longos."
