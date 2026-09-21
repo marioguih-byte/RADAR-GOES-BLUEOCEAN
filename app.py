@@ -3,8 +3,10 @@ import pandas as pd
 import requests
 import streamlit as st
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 
 st.set_page_config(page_title='RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES', page_icon='🌩️', layout='wide')
 
@@ -80,8 +82,23 @@ def plotar(grid_lat,grid_lon,field,unit,ulat,ulon,when,title,label,vmax,cmap,poi
     ax.add_feature(cfeature.COASTLINE,linewidth=.75,zorder=3); ax.add_feature(cfeature.BORDERS,linewidth=.6,zorder=3)
     try: ax.add_feature(cfeature.STATES.with_scale('10m'),linewidth=.35,zorder=3)
     except Exception: pass
-    gl=ax.gridlines(draw_labels=True,linewidth=.3,alpha=.5,linestyle='--'); gl.top_labels=False; gl.right_labels=False
-    ax.scatter([ulon],[ulat],s=90,marker='^',facecolor='white',edgecolor='black',linewidth=1.4,zorder=5)
+    # Não usar GeoAxes.gridlines aqui: algumas combinações Cartopy/Shapely
+    # podem falhar na construção do polígono da moldura durante o draw.
+    # A grade é desenhada com ticks normais do GeoAxes, mantendo Cartopy.
+    xmin, xmax = float(grid_lon.min()), float(grid_lon.max())
+    ymin, ymax = float(grid_lat.min()), float(grid_lat.max())
+    xt = np.arange(np.floor(xmin), np.ceil(xmax) + 1, 1.0)
+    yt = np.arange(np.floor(ymin), np.ceil(ymax) + 1, 1.0)
+    ax.set_xticks(xt, crs=ccrs.PlateCarree())
+    ax.set_yticks(yt, crs=ccrs.PlateCarree())
+    ax.xaxis.set_major_locator(FixedLocator(xt))
+    ax.yaxis.set_major_locator(FixedLocator(yt))
+    ax.xaxis.set_major_formatter(LongitudeFormatter(number_format='.0f', degree_symbol='°'))
+    ax.yaxis.set_major_formatter(LatitudeFormatter(number_format='.0f', degree_symbol='°'))
+    ax.tick_params(axis='both', labelsize=8.5, length=3, width=.6)
+    ax.grid(True, linewidth=.35, alpha=.4, linestyle='--', zorder=2)
+
+    ax.scatter([ulon],[ulat],s=90,marker='^',facecolor='white',edgecolor='black',linewidth=1.4,zorder=5,transform=ccrs.PlateCarree())
     if st.session_state.get('show_points',True): ax.scatter(points['lon'],points['lat'],s=7,c='black',alpha=.25,zorder=4,transform=ccrs.PlateCarree())
     ax.set_title(f'{unit}\n{pd.Timestamp(when):%d/%m/%Y %H:%M} local • {title}',fontsize=12.5,fontweight='bold',pad=10)
     cb=plt.colorbar(cf,ax=ax,pad=.02,shrink=.80); cb.set_label(label)
