@@ -648,6 +648,22 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
     fig.subplots_adjust(left=0.055, right=0.91, bottom=0.08, top=0.85)
     return fig
 
+
+@st.cache_data(max_entries=60, show_spinner=False)
+def mapa_cartopy_png(field_bytes, field_shape, gla_bytes, glo_bytes, unit, ulat, ulon, when_iso, title, label, vmax, cmap, mode):
+    field = np.frombuffer(field_bytes, dtype=np.float32).reshape(tuple(field_shape)).astype(float)
+    gla = np.frombuffer(gla_bytes, dtype=np.float32).reshape(tuple(field_shape)).astype(float)
+    glo = np.frombuffer(glo_bytes, dtype=np.float32).reshape(tuple(field_shape)).astype(float)
+    fig = mapa_cartopy(
+        gla, glo, field, unit, ulat, ulon, pd.Timestamp(when_iso), title, label, vmax, cmap, mode
+    )
+    # Reposiciona o campo diretamente na projeção da grade fixa usada pela função de mapa.
+    # O mapa é gerado aqui apenas para criar o PNG; depois o byte array é reutilizado no cache.
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", facecolor="white", bbox_inches=None)
+    plt.close(fig)
+    return buffer.getvalue()
+
 st.markdown(
     """
     <style>
@@ -671,7 +687,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO DWD ICON + GOES-19 GLM • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO DWD ICON + GOES-19 GLM • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS • NAVEGAÇÃO OTIMIZADA")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -690,7 +706,7 @@ with st.sidebar:
     st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
     if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
         consultar_previsao_icon.clear()
-        consultar_previsao_icon.clear()
+        fetch_glm_recent.clear()
         st.session_state.time_index = 0
         st.rerun()
 
@@ -698,17 +714,18 @@ GLA, GLO = make_grid(ulat, ulon)
 lats = tuple(GLA.ravel().tolist())
 lons = tuple(GLO.ravel().tolist())
 
+if "forecast_cache_key" not in st.session_state or st.session_state.forecast_cache_key != (ulat, ulon):
+    st.session_state.forecast_cache_key = (ulat, ulon)
+    st.session_state.time_index = 0
+
 with st.spinner(f"CONSULTANDO OPEN-METEO / ICON — {len(lats)} PONTOS..."):
     try:
-        # Uma única consulta regional ao DWD ICON: precipitação, rajadas e
-        # todas as variáveis utilizadas no potencial de raios.
         df = consultar_previsao_icon(lats, lons)
         df = calcular_indice_holistico(df)
     except Exception as exc:
         st.error(f"ERRO AO CONSULTAR OPEN-METEO / ICON: {type(exc).__name__}: {exc}")
         st.stop()
 
-# Tempos horários 0h ... +6h.
 times = sorted(df["tempo"].drop_duplicates())[:horas + 1]
 if not times:
     st.error("A API não retornou horários para a região.")
@@ -723,141 +740,164 @@ with st.spinner("CONSULTANDO GOES-19 GLM REAL — ÚLTIMOS 12 MINUTOS..."):
 if "time_index" not in st.session_state or st.session_state.time_index >= len(times):
     st.session_state.time_index = 0
 
-c_prev, c_hour, c_next = st.columns([1, 2, 1])
-with c_prev:
-    if st.button("◀ HORA ANTERIOR", use_container_width=True, disabled=st.session_state.time_index == 0):
-        st.session_state.time_index -= 1
-        st.rerun()
-with c_hour:
+
+def _render_map_image(field, when, title, label, vmax, cmap, mode):
+    safe = np.nan_to_num(np.asarray(field, dtype=np.float32), nan=0.0, posinf=100.0, neginf=0.0)
+    return mapa_cartopy_png(
+        safe.tobytes(), safe.shape,
+        np.asarray(GLA, dtype=np.float32).tobytes(),
+        np.asarray(GLO, dtype=np.float32).tobytes(),
+        unidade_nome, ulat, ulon, pd.Timestamp(when).isoformat(),
+        title, label, float(vmax), cmap, mode,
+    )
+
+
+@st.fragment
+def render_forecast_fragment():
+    c_prev, c_hour, c_next = st.columns([1, 2, 1])
+    with c_prev:
+        if st.button("◀ HORA ANTERIOR", use_container_width=True, disabled=st.session_state.time_index == 0, key="prev_hour"):
+            st.session_state.time_index -= 1
+    with c_hour:
+        st.markdown(
+            f'<div class="nav-hour"><div class="main">{pd.Timestamp(times[st.session_state.time_index]):%d/%m/%Y %H:%M}</div>'
+            f'<div class="sub">HORA {st.session_state.time_index:+d} • LOCAL</div></div>',
+            unsafe_allow_html=True,
+        )
+    with c_next:
+        if st.button("PRÓXIMA HORA ▶", use_container_width=True, disabled=st.session_state.time_index == len(times) - 1, key="next_hour"):
+            st.session_state.time_index += 1
+
+    current_index = int(st.session_state.time_index)
+    when = times[current_index]
+    fr = df[df["tempo"] == when].copy()
+
+    vmax_p = max(8.0, float(np.nanpercentile(df["precipitation"], 98)) if np.isfinite(df["precipitation"]).any() else 8.0)
+    vmax_g = max(60.0, float(np.nanpercentile(df["wind_gusts_10m"], 98)) if np.isfinite(df["wind_gusts_10m"]).any() else 60.0)
+
+    try:
+        camada = st.segmented_control(
+            "CAMADA",
+            ["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POTENCIAL DE RAIOS"],
+            default="🌧️ PRECIPITAÇÃO",
+            key="camada_mapa",
+            label_visibility="collapsed",
+        )
+    except AttributeError:
+        camada = st.radio(
+            "CAMADA",
+            ["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POTENCIAL DE RAIOS"],
+            horizontal=True,
+            key="camada_mapa",
+            label_visibility="collapsed",
+        )
+
+    if camada == "🌧️ PRECIPITAÇÃO":
+        field = idw_grid(fr.lat, fr.lon, fr["precipitation"], GLA, GLO)
+        png = _render_map_image(field, when, "PRECIPITAÇÃO • ICON", "PRECIPITAÇÃO (MM/H)", vmax_p, "turbo", "normal")
+        st.image(png, width="stretch")
+
+    elif camada == "💨 RAJADA DE VENTO":
+        field = idw_grid(fr.lat, fr.lon, fr["wind_gusts_10m"], GLA, GLO)
+        png = _render_map_image(field, when, "RAJADA DE VENTO • ICON", "RAJADA (KM/H)", vmax_g, "magma", "normal")
+        st.image(png, width="stretch")
+
+    else:
+        icon_field = idw_grid(fr.lat, fr.lon, fr["raios_score"], GLA, GLO)
+        glm_field = glm_field_nowcast(glm_df, GLA, GLO, current_index) if not glm_df.empty else np.zeros_like(icon_field)
+        if not glm_df.empty and current_index == 0:
+            field = np.maximum(icon_field, 0.95 * glm_field)
+        elif not glm_df.empty:
+            h = current_index
+            w_glm = float(0.65 * np.exp(-h / 3.0))
+            field = np.clip((1.0 - w_glm) * icon_field + w_glm * glm_field, 0, 100)
+        else:
+            field = icon_field
+        png = _render_map_image(
+            field, when,
+            "POTENCIAL HOLÍSTICO DE RAIOS • ICON + GOES-19 GLM", "", 100, "YlOrRd", "raios",
+        )
+        st.image(png, width="stretch")
+        if glm_df.empty:
+            st.caption("GOES-19 GLM: nenhuma observação recente disponível; o mapa utiliza o potencial previsto pelo ICON.")
+        else:
+            glm_recent_count = int(len(_glm_split_windows(glm_df)[0]))
+            glm_last = glm_df["tempo"].max()
+            age_min = max(0.0, (datetime.now(timezone.utc) - glm_last.to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60.0)
+            st.caption(f"GOES-19 GLM real: {glm_recent_count} flashes na janela recente • última observação {glm_last:%d/%m %H:%M:%S}Z • atraso {age_min:.1f} min. Sem pontos individuais no mapa.")
+
+    nearest_i = ((fr["lat"] - ulat).abs() + (fr["lon"] - ulon).abs()).idxmin()
+    unit_row = fr.loc[nearest_i]
+    neighbor = fr[(fr["lat"].sub(ulat).abs() <= 1.0) & (fr["lon"].sub(ulon).abs() <= 1.0)]
+    local_context = float(np.nanpercentile(neighbor["raios_score"], 80)) if np.isfinite(neighbor["raios_score"]).any() else float(unit_row["raios_score"])
+    icon_unit_score = float(np.clip(0.75 * float(unit_row["raios_score"]) + 0.25 * local_context, 0, 100))
+    glm_now_score, glm_now_count, _ = glm_unit_score(glm_df, ulat, ulon, 0)
+    if current_index == 0 and glm_now_count > 0:
+        unit_score = max(icon_unit_score, glm_now_score)
+    elif not glm_df.empty:
+        glm_future_score, _, _ = glm_unit_score(glm_df, ulat, ulon, current_index)
+        w_glm = float(0.65 * np.exp(-current_index / 3.0))
+        unit_score = (1.0 - w_glm) * icon_unit_score + w_glm * glm_future_score
+    else:
+        unit_score = icon_unit_score
+    unit_score = float(np.clip(unit_score, 0, 100))
+    unit_class = str(np.select([unit_score < 20, unit_score < 40, unit_score < 60, unit_score < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO"))
+
+    st.subheader("CONDIÇÕES NA UNIDADE")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("PRECIPITAÇÃO", f"{float(unit_row['precipitation']):.1f} MM/H")
+    c2.metric("RAJADA", f"{float(unit_row['wind_gusts_10m']):.0f} KM/H")
+    tp = unit_row["precipitation_probability"]
+    c3.metric("PROB. CHUVA", "N/D" if pd.isna(tp) else f"{float(tp):.0f}%")
+    c4.metric("CAPE", f"{float(unit_row['cape']):.0f} J/KG")
+    c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
+
+    color = classe_cor(unit_class)
     st.markdown(
-        f'<div class="nav-hour"><div class="main">{pd.Timestamp(times[st.session_state.time_index]):%d/%m/%Y %H:%M}</div>'
-        f'<div class="sub">HORA {st.session_state.time_index:+d} • LOCAL</div></div>',
+        f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
+        f'<div class="lightning-sub">A base prevista usa o ICON. No horário corrente, o resultado incorpora flashes reais observados pelo GLM do GOES-19; nas horas seguintes, a observação recente alimenta um nowcast espacial com deslocamento e decaimento de curto prazo.</div>'
+        f'<div class="legend-row">'
+        f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
+        f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
+        f'<span class="legend-chip" style="background:#FDD835">40–59 MODERADO</span>'
+        f'<span class="legend-chip" style="background:#FB8C00">60–79 ALTO</span>'
+        f'<span class="legend-chip" style="background:#D32F2F;color:#fff">80–100 MUITO ALTO</span>'
+        f'</div>'
+        f'<div style="margin-top:10px;font-weight:800;color:{color}">INDICADOR PARA A UNIDADE: {unit_score:.0f}/100 — {unit_class}</div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
-with c_next:
-    if st.button("PRÓXIMA HORA ▶", use_container_width=True, disabled=st.session_state.time_index == len(times) - 1):
-        st.session_state.time_index += 1
-        st.rerun()
 
-when = times[st.session_state.time_index]
-fr = df[df["tempo"] == when].copy()
-
-# Grade de plotagem com 0,5° para preservar o aspecto pixelado.
-plot_lat = np.arange(float(GLO.min()) * 0 + float(GLO.min()), float(GLO.max()) + GRID_STEP * 0.51, GRID_STEP)
-plot_lon = np.arange(float(GLO.min()), float(GLO.max()) + GRID_STEP * 0.51, GRID_STEP)
-# GLA/GLO já formam uma grade regular; usar os próprios centros mantém os pixels originais.
-PGLA, PGLO = GLA.copy(), GLO.copy()
-
-vmax_p = max(8.0, float(np.nanpercentile(df["precipitation"], 98)) if np.isfinite(df["precipitation"]).any() else 8.0)
-vmax_g = max(60.0, float(np.nanpercentile(df["wind_gusts_10m"], 98)) if np.isfinite(df["wind_gusts_10m"]).any() else 60.0)
-
-T1, T2, T3 = st.tabs(["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POTENCIAL DE RAIOS"])
-
-with T1:
-    field = idw_grid(fr.lat, fr.lon, fr["precipitation"], PGLA, PGLO)
-    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "PRECIPITAÇÃO • ICON", "PRECIPITAÇÃO (MM/H)", vmax_p, "turbo", "normal")
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-with T2:
-    field = idw_grid(fr.lat, fr.lon, fr["wind_gusts_10m"], PGLA, PGLO)
-    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "RAJADA DE VENTO • ICON", "RAJADA (KM/H)", vmax_g, "magma", "normal")
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-with T3:
-    icon_field = idw_grid(fr.lat, fr.lon, fr["raios_score"], PGLA, PGLO)
-    glm_field = glm_field_nowcast(glm_df, PGLA, PGLO, st.session_state.time_index) if not glm_df.empty else np.zeros_like(icon_field)
-    if not glm_df.empty and st.session_state.time_index == 0:
-        field = np.maximum(icon_field, 0.95 * glm_field)
-    elif not glm_df.empty:
-        h = st.session_state.time_index
-        w_glm = float(0.65 * np.exp(-h / 3.0))
-        field = np.clip((1.0 - w_glm) * icon_field + w_glm * glm_field, 0, 100)
-    else:
-        field = icon_field
-    fig = mapa_cartopy(
-        PGLA, PGLO, field, unidade_nome, ulat, ulon, when,
-        "POTENCIAL HOLÍSTICO DE RAIOS • ICON + GOES-19 GLM", "", 100, "YlOrRd", "raios"
+    st.subheader("PREVISÃO HORÁRIA NA UNIDADE")
+    nearest = ((df["lat"] - ulat).abs() + (df["lon"] - ulon).abs()).groupby(df["tempo"]).idxmin()
+    serie = df.loc[nearest].sort_values("tempo").head(horas + 1).copy()
+    serie["TEMPO"] = pd.to_datetime(serie["tempo"]).dt.strftime("%d/%m %H:%M")
+    serie["HORIZONTE"] = [f"{i:+d} H" for i in range(len(serie))]
+    serie["PRECIPITAÇÃO (MM/H)"] = serie["precipitation"].round(1)
+    serie["RAJADA (KM/H)"] = serie["wind_gusts_10m"].round(0)
+    raios_tabela = []
+    for h, (_, row) in enumerate(serie.iterrows()):
+        icon_score = float(row["raios_score"])
+        if not glm_df.empty and h == 0:
+            gs, gc, _ = glm_unit_score(glm_df, ulat, ulon, 0)
+            score = max(icon_score, gs) if gc > 0 else icon_score
+        elif not glm_df.empty:
+            gs, _, _ = glm_unit_score(glm_df, ulat, ulon, h)
+            w = float(0.65 * np.exp(-h / 3.0))
+            score = (1.0 - w) * icon_score + w * gs
+        else:
+            score = icon_score
+        raios_tabela.append(float(np.clip(score, 0, 100)))
+    serie["RAIOS (0–100)"] = np.round(raios_tabela, 0)
+    serie["CLASSE"] = np.select(
+        [serie["RAIOS (0–100)"] < 20, serie["RAIOS (0–100)"] < 40, serie["RAIOS (0–100)"] < 60, serie["RAIOS (0–100)"] < 80],
+        ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO"
     )
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-    if glm_df.empty:
-        st.caption("GOES-19 GLM: nenhuma observação recente disponível; o mapa utiliza o potencial previsto pelo ICON.")
-    else:
-        glm_recent_count = int(len(_glm_split_windows(glm_df)[0]))
-        glm_last = glm_df["tempo"].max()
-        age_min = max(0.0, (datetime.now(timezone.utc) - glm_last.to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60.0)
-        st.caption(f"GOES-19 GLM real: {glm_recent_count} flashes na janela recente • última observação {glm_last:%d/%m %H:%M:%S}Z • atraso {age_min:.1f} min. Sem pontos individuais no mapa.")
+    tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", "RAIOS (0–100)", "CLASSE"]]
+    st.dataframe(tabela, width="stretch", hide_index=True)
+    st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-# Valor na unidade e contexto ao redor.
-nearest_i = ((fr["lat"] - ulat).abs() + (fr["lon"] - ulon).abs()).idxmin()
-unit_row = fr.loc[nearest_i]
-neighbor = fr[(fr["lat"].sub(ulat).abs() <= 1.0) & (fr["lon"].sub(ulon).abs() <= 1.0)]
-local_context = float(np.nanpercentile(neighbor["raios_score"], 80)) if np.isfinite(neighbor["raios_score"]).any() else float(unit_row["raios_score"])
-icon_unit_score = float(np.clip(0.75 * float(unit_row["raios_score"]) + 0.25 * local_context, 0, 100))
-glm_now_score, glm_now_count, _ = glm_unit_score(glm_df, ulat, ulon, 0)
-if st.session_state.time_index == 0 and glm_now_count > 0:
-    unit_score = max(icon_unit_score, glm_now_score)
-elif not glm_df.empty:
-    h = st.session_state.time_index
-    glm_future_score, _, _ = glm_unit_score(glm_df, ulat, ulon, h)
-    w_glm = float(0.65 * np.exp(-h / 3.0))
-    unit_score = (1.0 - w_glm) * icon_unit_score + w_glm * glm_future_score
-else:
-    unit_score = icon_unit_score
-unit_score = float(np.clip(unit_score, 0, 100))
-unit_class = str(np.select([unit_score < 20, unit_score < 40, unit_score < 60, unit_score < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO"))
 
-st.subheader("CONDIÇÕES NA UNIDADE")
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("PRECIPITAÇÃO", f"{float(unit_row['precipitation']):.1f} MM/H")
-c2.metric("RAJADA", f"{float(unit_row['wind_gusts_10m']):.0f} KM/H")
-tp = unit_row['precipitation_probability']
-c3.metric("PROB. CHUVA", "N/D" if pd.isna(tp) else f"{float(tp):.0f}%")
-c4.metric("CAPE", f"{float(unit_row['cape']):.0f} J/KG")
-c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
-
-color = classe_cor(unit_class)
-st.markdown(
-    f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
-    f'<div class="lightning-sub">A base prevista usa o ICON. No horário corrente, o resultado incorpora flashes reais observados pelo GLM do GOES-19; nas horas seguintes, a observação recente alimenta um nowcast espacial com deslocamento e decaimento de curto prazo.</div>'
-    f'<div class="legend-row">'
-    f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
-    f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
-    f'<span class="legend-chip" style="background:#FDD835">40–59 MODERADO</span>'
-    f'<span class="legend-chip" style="background:#FB8C00">60–79 ALTO</span>'
-    f'<span class="legend-chip" style="background:#D32F2F;color:#fff">80–100 MUITO ALTO</span>'
-    f'</div>'
-    f'<div style="margin-top:10px;font-weight:800;color:{color}">INDICADOR PARA A UNIDADE: {unit_score:.0f}/100 — {unit_class}</div>'
-    f'</div>',
-    unsafe_allow_html=True,
-)
-
-st.subheader("PREVISÃO HORÁRIA NA UNIDADE")
-nearest = ((df["lat"] - ulat).abs() + (df["lon"] - ulon).abs()).groupby(df["tempo"]).idxmin()
-serie = df.loc[nearest].sort_values("tempo").head(horas + 1).copy()
-serie["TEMPO"] = pd.to_datetime(serie["tempo"]).dt.strftime("%d/%m %H:%M")
-serie["HORIZONTE"] = [f"{i:+d} H" for i in range(len(serie))]
-serie["PRECIPITAÇÃO (MM/H)"] = serie["precipitation"].round(1)
-serie["RAJADA (KM/H)"] = serie["wind_gusts_10m"].round(0)
-raios_tabela = []
-for h, (_, row) in enumerate(serie.iterrows()):
-    icon_score = float(row["raios_score"])
-    if not glm_df.empty and h == 0:
-        gs, gc, _ = glm_unit_score(glm_df, ulat, ulon, 0)
-        score = max(icon_score, gs) if gc > 0 else icon_score
-    elif not glm_df.empty:
-        gs, _, _ = glm_unit_score(glm_df, ulat, ulon, h)
-        w = float(0.65 * np.exp(-h / 3.0))
-        score = (1.0 - w) * icon_score + w * gs
-    else:
-        score = icon_score
-    raios_tabela.append(float(np.clip(score, 0, 100)))
-serie["RAIOS (0–100)"] = np.round(raios_tabela, 0)
-serie["CLASSE"] = np.select([serie["RAIOS (0–100)"] < 20, serie["RAIOS (0–100)"] < 40, serie["RAIOS (0–100)"] < 60, serie["RAIOS (0–100)"] < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO")
-tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", "RAIOS (0–100)", "CLASSE"]]
-st.dataframe(tabela, use_container_width=True, hide_index=True)
-st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
+render_forecast_fragment()
 
 st.caption("PRECIPITAÇÃO E RAJADAS: OPEN-METEO / DWD ICON. RAIOS: potencial previsto do ICON combinado com observação real recente do GOES-19 GLM e nowcast de curto prazo. O índice não representa uma probabilidade estatística calibrada.")
