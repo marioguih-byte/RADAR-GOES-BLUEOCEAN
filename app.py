@@ -3,6 +3,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,8 @@ GRID_STEP = 0.5
 IDW_POWER = 4.0
 MAX_HOURS = 6
 TZ = "America/Sao_Paulo"
+REGION_HALFSPAN = 2.5
+GLM_WINDOW_MIN = 10
 
 st.set_page_config(page_title=SITE_TITLE, page_icon="⚡", layout="wide")
 
@@ -112,7 +115,9 @@ def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER
     return out.reshape(np.asarray(grid_lat).shape)
 
 
-def make_grid(lat0, lon0, halfspan):
+def make_grid(lat0, lon0):
+    """Grade espacial fixa em 0,5° ao redor da unidade."""
+    halfspan = REGION_HALFSPAN
     step = GRID_STEP
     lat_min = np.floor((lat0 - halfspan) / step) * step
     lat_max = np.ceil((lat0 + halfspan) / step) * step
@@ -145,9 +150,8 @@ def parse_openmeteo(raw, lats, lons, variable_names):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def consultar_previsao(lats_tuple, lons_tuple):
-    lats = list(lats_tuple)
-    lons = list(lons_tuple)
+def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
+    """Uma única chamada ao Open-Meteo/ECMWF para toda a grade."""
     variables = [
         "precipitation",
         "precipitation_probability",
@@ -160,186 +164,37 @@ def consultar_previsao(lats_tuple, lons_tuple):
         "relative_humidity_2m",
         "cloud_cover",
         "weather_code",
+        "lightning_density",
     ]
-
-    frames = []
-    for la, lo in zip(batches(lats, 40), batches(lons, 40)):
-        params = {
-            "latitude": ",".join(f"{x:.5f}" for x in la),
-            "longitude": ",".join(f"{x:.5f}" for x in lo),
-            "hourly": ",".join(variables),
-            "forecast_hours": MAX_HOURS + 1,
-            "timezone": TZ,
-            "wind_speed_unit": "kmh",
-            "precipitation_unit": "mm",
-            "temperature_unit": "celsius",
-            "cell_selection": "land",
-            "models": "best_match",
-        }
-        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=60)
-        r.raise_for_status()
-        frames.append(parse_openmeteo(r.json(), la, lo, variables))
-
-    df = pd.concat(frames, ignore_index=True)
-    numeric = [v for v in variables if v != "weather_code"]
-    for col in numeric:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def consultar_raios_ecmwf(lats_tuple, lons_tuple):
-    lats = list(lats_tuple)
-    lons = list(lons_tuple)
-    variables = ["lightning_density"]
-    frames = []
-    for la, lo in zip(batches(lats, 40), batches(lons, 40)):
-        params = {
-            "latitude": ",".join(f"{x:.5f}" for x in la),
-            "longitude": ",".join(f"{x:.5f}" for x in lo),
-            "hourly": "lightning_density",
-            "forecast_hours": MAX_HOURS + 1,
-            "timezone": TZ,
-            "wind_speed_unit": "kmh",
-            "precipitation_unit": "mm",
-            "temperature_unit": "celsius",
-            "cell_selection": "land",
-        }
-        r = requests.get("https://api.open-meteo.com/v1/ecmwf", params=params, timeout=60)
-        r.raise_for_status()
-        frames.append(parse_openmeteo(r.json(), la, lo, variables))
-    return pd.concat(frames, ignore_index=True)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def consultar_trovoada_gfs(lats_tuple, lons_tuple):
-    lats = list(lats_tuple)
-    lons = list(lons_tuple)
-    frames = []
-    for la, lo in zip(batches(lats, 40), batches(lons, 40)):
-        params = {
-            "latitude": ",".join(f"{x:.5f}" for x in la),
-            "longitude": ",".join(f"{x:.5f}" for x in lo),
-            "hourly": "thunderstorm_probability",
-            "forecast_hours": MAX_HOURS + 1,
-            "timezone": TZ,
-            "cell_selection": "land",
-        }
-        r = requests.get("https://api.open-meteo.com/v1/gfs", params=params, timeout=60)
-        r.raise_for_status()
-        frames.append(parse_openmeteo(r.json(), la, lo, ["thunderstorm_probability"]))
-    return pd.concat(frames, ignore_index=True)
-
-
-def _parse_s3_key_time(key):
-    m = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})", key)
-    if not m:
-        return None
-    year, doy, hh, mm, ss = map(int, m.groups())
-    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy-1, hours=hh, minutes=mm, seconds=ss)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def consultar_glm_10min(lats_tuple, lons_tuple, unit_lat, unit_lon):
-    """Busca os últimos 10 min de GLM-L2-LCFA do GOES-19 e conta flashes.
-
-    O produto GLM-L2-LCFA contém flashes individuais, com latitude/longitude
-    do centroide. Cada arquivo cobre um período de 20 s. O cálculo abaixo usa
-    um raio de 75 km para produzir uma medida local de atividade recente.
-    """
-    now = datetime.now(timezone.utc)
-    prefixes = []
-    for h in [now.replace(minute=0, second=0, microsecond=0),
-              (now - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)]:
-        prefixes.append(f"GLM-L2-LCFA/{h:%Y}/{h.timetuple().tm_yday:03d}/{h:%H}/")
-
-    keys = []
-    for prefix in prefixes:
+    params = {
+        "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
+        "longitude": ",".join(f"{x:.5f}" for x in lons_tuple),
+        "hourly": ",".join(variables),
+        "forecast_hours": MAX_HOURS + 1,
+        "timezone": TZ,
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+        "temperature_unit": "celsius",
+        "cell_selection": "land",
+    }
+    last = None
+    for attempt in range(4):
         try:
-            r = requests.get(
-                "https://noaa-goes19.s3.amazonaws.com/",
-                params={"list-type": "2", "prefix": prefix, "max-keys": 1000},
-                timeout=30,
-            )
+            r = requests.get("https://api.open-meteo.com/v1/ecmwf", params=params, timeout=75)
+            if r.status_code == 429:
+                wait = 1.5 * (2 ** attempt)
+                import time
+                time.sleep(wait)
+                last = RuntimeError(f"HTTP 429 após tentativa {attempt + 1}")
+                continue
             r.raise_for_status()
-            keys.extend(re.findall(r"<Key>([^<]*GLM-L2-LCFA[^<]*)</Key>", r.text))
-        except Exception:
-            continue
-
-    cutoff = now - timedelta(minutes=10)
-    selected = []
-    for key in keys:
-        t = _parse_s3_key_time(key)
-        if t is not None and cutoff <= t <= now + timedelta(seconds=30):
-            selected.append((t, key))
-    selected = sorted({k: (t, k) for t, k in selected}.values())
-
-    if not selected:
-        empty = pd.DataFrame({
-            "lat": list(lats_tuple), "lon": list(lons_tuple),
-            "glm_flashes_10min": 0.0, "glm_score": 0.0,
-        })
-        return empty, 0, 0, "SEM DADOS GLM"
-
-    flashes_lat = []
-    flashes_lon = []
-    success = 0
-    for _, key in selected[-36:]:
-        try:
-            rr = requests.get(f"https://noaa-goes19.s3.amazonaws.com/{key}", timeout=45)
-            rr.raise_for_status()
-            with h5py.File(io.BytesIO(rr.content), "r") as ds:
-                if "flash_lat" not in ds or "flash_lon" not in ds:
-                    continue
-                la = np.asarray(ds["flash_lat"][:], dtype=float)
-                lo = np.asarray(ds["flash_lon"][:], dtype=float)
-            good = np.isfinite(la) & np.isfinite(lo)
-            if good.any():
-                flashes_lat.append(la[good])
-                flashes_lon.append(lo[good])
-            success += 1
-        except Exception:
-            continue
-
-    if not flashes_lat:
-        empty = pd.DataFrame({
-            "lat": list(lats_tuple), "lon": list(lons_tuple),
-            "glm_flashes_10min": 0.0, "glm_score": 0.0,
-        })
-        return empty, 0, success, "GLM SEM FLASHES"
-
-    fla = np.concatenate(flashes_lat)
-    flo = np.concatenate(flashes_lon)
-
-    # Filtra geograficamente para manter o cálculo leve.
-    glat_arr = np.asarray(lats_tuple, float)
-    glon_arr = np.asarray(lons_tuple, float)
-    keep = (
-        (fla >= glat_arr.min() - 1.5) & (fla <= glat_arr.max() + 1.5) &
-        (flo >= glon_arr.min() - 1.5) & (flo <= glon_arr.max() + 1.5)
-    )
-    fla, flo = fla[keep], flo[keep]
-
-    def count_around(qla, qlo, radius_km=75.0):
-        if fla.size == 0:
-            return 0
-        lat0 = np.deg2rad(float(qla))
-        dx = (flo - float(qlo)) * 111.32 * np.cos(lat0)
-        dy = (fla - float(qla)) * 111.32
-        return int(np.count_nonzero(dx*dx + dy*dy <= radius_km*radius_km))
-
-    counts = np.array([count_around(a, o) for a, o in zip(glat_arr, glon_arr)], dtype=float)
-    # Escala saturante: 10 flashes/10min = ~57, 20 = ~81, 30 = ~92.
-    scores = 100.0 * (1.0 - np.exp(-counts / 12.0))
-    unit_count = count_around(unit_lat, unit_lon)
-    unit_score = 100.0 * (1.0 - np.exp(-unit_count / 12.0))
-
-    result = pd.DataFrame({
-        "lat": glat_arr, "lon": glon_arr,
-        "glm_flashes_10min": counts, "glm_score": scores,
-    })
-    return result, int(unit_count), int(success), f"GLM OK • {success} arquivos"
-
+            return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), variables)
+        except Exception as exc:
+            last = exc
+            if attempt < 3:
+                import time
+                time.sleep(1.0 * (2 ** attempt))
+    raise last
 
 
 def calcular_indice_holistico(df):
@@ -351,73 +206,131 @@ def calcular_indice_holistico(df):
     cin = df["convective_inhibition"].fillna(0).to_numpy(float)
     rh = np.clip(df["relative_humidity_2m"].fillna(0).to_numpy(float), 0, 100)
     cloud = np.clip(df["cloud_cover"].fillna(0).to_numpy(float), 0, 100)
-    tprob = np.clip(df["thunderstorm_probability"].fillna(0).to_numpy(float), 0, 100)
-    code = df["weather_code"].fillna(-1).to_numpy(float)
     ld = np.clip(df["lightning_density"].fillna(0).to_numpy(float), 0, None)
+    code = df["weather_code"].fillna(-1).to_numpy(float)
     glm = np.clip(df["glm_score"].fillna(0).to_numpy(float), 0, 100)
 
     s_showers = normalizar_0_1(showers, 0.2, 8.0) * 100
     s_cape = normalizar_0_1(cape, 100, 1800) * 100
     s_li = normalizar_0_1(-li, 0.0, 5.0) * 100
-    s_pp = pp
     s_rh = normalizar_0_1(rh, 65, 100) * 100
     s_cloud = normalizar_0_1(cloud, 55, 100) * 100
     s_cin = normalizar_0_1(-cin, 0, 120) * 100
     s_prec = normalizar_0_1(p, 0.3, 12) * 100
     s_code = np.where(np.isin(code.astype(int), [95, 96, 99]), 100.0, 0.0)
 
+    # Densidade de raios prevista pelo IFS: normalização robusta por horário.
     density_score = np.zeros(len(df), dtype=float)
     if np.isfinite(ld).any() and np.nanmax(ld) > 0:
-        by_time = pd.Series(ld).groupby(df["tempo"]).transform(
-            lambda s: max(float(np.nanpercentile(s, 95)), 1e-9)
-        ).to_numpy()
-        density_score = np.clip(
-            np.log1p(ld) / np.log1p(np.maximum(by_time, 1e-9)) * 100,
-            0, 100,
-        )
-        density_score[ld <= 0] = 0
+        density_score = np.empty(len(df), dtype=float)
+        for t, idx in df.groupby("tempo").groups.items():
+            vals = ld[np.asarray(list(idx), dtype=int)]
+            ref = max(float(np.nanpercentile(vals, 90)), 0.05)
+            density_score[np.asarray(list(idx), dtype=int)] = np.clip(vals / ref * 100.0, 0, 100)
 
+    # Sem GLM futuro, o modelo domina; o GLM atual entra somente no instante 0.
     model_score = (
-        0.35 * tprob +
-        0.25 * density_score +
-        0.10 * s_code +
+        0.38 * density_score +
+        0.16 * s_showers +
+        0.12 * s_prec +
+        0.10 * pp +
         0.08 * s_cape +
-        0.07 * s_showers +
-        0.04 * s_pp +
-        0.03 * s_rh +
-        0.02 * s_cloud +
-        0.03 * s_li +
-        0.03 * s_cin
+        0.05 * s_li +
+        0.04 * s_rh +
+        0.03 * s_cloud +
+        0.02 * s_cin +
+        0.02 * s_code
     )
-
-    # GLM é usado como observação inicial e como memória de curto prazo para
-    # os próximos horários. Isso corrige o caso em que uma tempestade já está
-    # ocorrendo, mas a previsão numérica não acompanha imediatamente.
     base_time = pd.Timestamp(df["tempo"].min())
     lead_h = (pd.to_datetime(df["tempo"]) - base_time).dt.total_seconds().to_numpy() / 3600.0
-    glm_weight = 0.60 * np.exp(-np.maximum(lead_h, 0) / 1.5)
+
+    # Observação GLM recente influencia fortemente a hora inicial e decai rapidamente.
+    glm_weight = 0.78 * np.exp(-np.maximum(lead_h, 0) / 1.25)
     score = (1 - glm_weight) * model_score + glm_weight * glm
 
-    # Quando o GLM observa atividade muito forte no horário inicial, impõe-se
-    # um piso de intensidade para que a observação não seja diluída.
-    glm_counts = df["glm_flashes_10min"].fillna(0).to_numpy(float)
+    counts = df["glm_flashes_10min"].fillna(0).to_numpy(float)
     current = lead_h <= 0.51
-    score[current & (glm_counts >= 30)] = np.maximum(score[current & (glm_counts >= 30)], 90)
-    score[current & (glm_counts >= 15) & (glm_counts < 30)] = np.maximum(score[current & (glm_counts >= 15) & (glm_counts < 30)], 80)
-    score[current & (glm_counts >= 8) & (glm_counts < 15)] = np.maximum(score[current & (glm_counts >= 8) & (glm_counts < 15)], 65)
-    score[current & (glm_counts >= 4) & (glm_counts < 8)] = np.maximum(score[current & (glm_counts >= 4) & (glm_counts < 8)], 50)
-    score[current & (glm_counts >= 2) & (glm_counts < 4)] = np.maximum(score[current & (glm_counts >= 2) & (glm_counts < 4)], 35)
-    score[current & (glm_counts >= 1) & (glm_counts < 2)] = np.maximum(score[current & (glm_counts >= 1) & (glm_counts < 2)], 20)
-
-    score = np.clip(score, 0, 100)
-    out = df.copy()
-    out["raios_score"] = score
-    out["raios_classe"] = np.select(
-        [score < 20, score < 40, score < 60, score < 80],
-        ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
-        default="MUITO ALTO",
+    floors = [(30,90),(15,80),(8,65),(4,50),(2,35),(1,20)]
+    for threshold, floor in floors:
+        mask = current & (counts >= threshold)
+        score[mask] = np.maximum(score[mask], floor)
+    return df.assign(
+        raios_score=np.clip(score, 0, 100),
+        raios_classe=np.select(
+            [score < 20, score < 40, score < 60, score < 80],
+            ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
+            default="MUITO ALTO",
+        ),
     )
-    return out
+
+def _parse_s3_key_time(key):
+    m = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})", key)
+    if not m:
+        return None
+    year, doy, hh, mm, ss = map(int, m.groups())
+    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy-1, hours=hh, minutes=mm, seconds=ss)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def consultar_glm_10min(unit_lat, unit_lon):
+    """Atividade GLM recente apenas para a unidade, com downloads concorrentes."""
+    now = datetime.now(timezone.utc)
+    prefixes = [f"GLM-L2-LCFA/{now:%Y}/{now.timetuple().tm_yday:03d}/{now:%H}/"]
+    if (now - timedelta(minutes=10)).hour != now.hour:
+        h = now - timedelta(hours=1)
+        prefixes.append(f"GLM-L2-LCFA/{h:%Y}/{h.timetuple().tm_yday:03d}/{h:%H}/")
+
+    keys=[]
+    for prefix in prefixes:
+        try:
+            r=requests.get("https://noaa-goes19.s3.amazonaws.com/",params={"list-type":"2","prefix":prefix,"max-keys":1000},timeout=20)
+            r.raise_for_status()
+            keys += re.findall(r"<Key>([^<]*GLM-L2-LCFA[^<]*)</Key>",r.text)
+        except Exception:
+            pass
+    cutoff=now-timedelta(minutes=GLM_WINDOW_MIN)
+    selected=[]
+    for key in keys:
+        t=_parse_s3_key_time(key)
+        if t is not None and cutoff<=t<=now+timedelta(seconds=30):
+            selected.append((t,key))
+    selected=sorted(selected)[-36:]
+    if not selected:
+        return 0,0,"GLM SEM DADOS"
+
+    def fetch(item):
+        _,key=item
+        try:
+            rr=requests.get(f"https://noaa-goes19.s3.amazonaws.com/{key}",timeout=30)
+            rr.raise_for_status()
+            with h5py.File(io.BytesIO(rr.content),"r") as ds:
+                if "flash_lat" not in ds or "flash_lon" not in ds:
+                    return np.array([]),np.array([]),False
+                la=np.asarray(ds["flash_lat"][:],dtype=float)
+                lo=np.asarray(ds["flash_lon"][:],dtype=float)
+            good=np.isfinite(la)&np.isfinite(lo)
+            return la[good],lo[good],True
+        except Exception:
+            return np.array([]),np.array([]),False
+
+    lats=[]; lons=[]; ok=0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs=[ex.submit(fetch,item) for item in selected]
+        for fut in as_completed(futs):
+            la,lo,good=fut.result()
+            if good:
+                ok+=1
+                if la.size:
+                    lats.append(la); lons.append(lo)
+    if not lats:
+        return 0,ok,"GLM SEM FLASHES"
+    fla=np.concatenate(lats); flo=np.concatenate(lons)
+    lat0=np.deg2rad(float(unit_lat))
+    dx=(flo-float(unit_lon))*111.32*np.cos(lat0)
+    dy=(fla-float(unit_lat))*111.32
+    count=int(np.count_nonzero(dx*dx+dy*dy <= 75.0**2))
+    score=float(100.0*(1.0-np.exp(-count/12.0)))
+    return count,ok,f"GLM OK • {ok} arquivos"
 
 def classe_cor(classe):
     return {
@@ -533,7 +446,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO ECMWF • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -545,48 +458,35 @@ with st.sidebar:
     unidade_nome = st.selectbox("UNIDADE", opcoes)
     unidade = next(u for u in UNIDADES if u[0] == unidade_nome)
     ulat, ulon = unidade[1], unidade[2]
-    halfspan = st.slider("EXTENSÃO DA REGIÃO (°)", 1.0, 5.0, 2.5, 0.5)
+    st.markdown(f"**EXTENSÃO DA REGIÃO:** FIXA EM ±{REGION_HALFSPAN:.1f}°")
     horas = st.slider("HORIZONTE", 1, 6, 6)
     st.markdown(f"**RESOLUÇÃO OPEN-METEO:** {GRID_STEP:.1f}°")
     st.markdown(f"**POTÊNCIA IDW:** FIXA EM {IDW_POWER:.1f}")
-    st.caption("A potência e a resolução são fixas para manter a comparação espacial consistente.")
+    st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
     if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
-        consultar_previsao.clear()
-        consultar_raios_ecmwf.clear()
+        consultar_previsao_ecmwf.clear()
+        consultar_glm_10min.clear()
         st.session_state.time_index = 0
         st.rerun()
 
-GLA, GLO = make_grid(ulat, ulon, halfspan)
+GLA, GLO = make_grid(ulat, ulon)
 lats = tuple(GLA.ravel().tolist())
 lons = tuple(GLO.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO E GLM PARA {len(lats)} PONTOS..."):
+with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS..."):
     try:
-        df = consultar_previsao(lats, lons)
+        df = consultar_previsao_ecmwf(lats, lons)
+        glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
         try:
-            ecmwf_df = consultar_raios_ecmwf(lats, lons)
-            df = df.merge(ecmwf_df, on=["lat", "lon", "tempo"], how="left")
-        except Exception:
-            df["lightning_density"] = np.nan
-        try:
-            gfs_df = consultar_trovoada_gfs(lats, lons)
-            df = df.merge(gfs_df, on=["lat", "lon", "tempo"], how="left")
-        except Exception:
-            df["thunderstorm_probability"] = np.nan
-
-        try:
-            glm_df, glm_unit_count, glm_files_ok, glm_status = consultar_glm_10min(
-                lats, lons, ulat, ulon
-            )
-            df = df.merge(glm_df, on=["lat", "lon"], how="left")
-        except Exception:
-            df["glm_flashes_10min"] = 0.0
-            df["glm_score"] = 0.0
-            glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
-
-        df["glm_flashes_10min"] = pd.to_numeric(df["glm_flashes_10min"], errors="coerce").fillna(0)
-        df["glm_score"] = pd.to_numeric(df["glm_score"], errors="coerce").fillna(0)
-        df["thunderstorm_probability"] = pd.to_numeric(df["thunderstorm_probability"], errors="coerce")
+            glm_unit_count, glm_files_ok, glm_status = consultar_glm_10min(ulat, ulon)
+        except Exception as exc:
+            glm_status = f"GLM INDISPONÍVEL • {type(exc).__name__}"
+        df["glm_flashes_10min"] = float(glm_unit_count)
+        df["glm_score"] = float(100.0 * (1.0 - np.exp(-glm_unit_count / 12.0)))
+        # Mantém o valor observado apenas no horário inicial; nos demais horários é zerado.
+        base_t = pd.Timestamp(df["tempo"].min())
+        df.loc[df["tempo"] != base_t, "glm_flashes_10min"] = 0.0
+        df.loc[df["tempo"] != base_t, "glm_score"] = 0.0
         df = calcular_indice_holistico(df)
     except Exception as exc:
         st.error(f"ERRO AO CONSULTAR OPEN-METEO/GLM: {type(exc).__name__}: {exc}")
@@ -672,7 +572,7 @@ color = classe_cor(unit_class)
 st.caption(f"GLM: {glm_status} • {glm_files_ok} arquivos processados • janela dos últimos 10 min • raio local de 75 km")
 st.markdown(
     f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
-    f'<div class="lightning-sub">O índice combina previsão de trovoada do GFS, densidade de raios do ECMWF e sinais convectivos do Open-Meteo. Nos minutos mais recentes, o GLM do GOES-19 entra como observação para representar tempestades que já estão ocorrendo.</div>'
+    f'<div class="lightning-sub">O índice combina densidade de raios prevista pelo ECMWF, chuva/pancadas, CAPE, Lifted Index, umidade, nebulosidade e outros sinais convectivos. A atividade recente do GLM do GOES-19 entra como observação no horário atual para corrigir tempestades já em andamento.</div>'
     f'<div class="legend-row">'
     f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
     f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
@@ -692,11 +592,10 @@ serie["TEMPO"] = pd.to_datetime(serie["tempo"]).dt.strftime("%d/%m %H:%M")
 serie["HORIZONTE"] = [f"{i:+d} H" for i in range(len(serie))]
 serie["PRECIPITAÇÃO (MM/H)"] = serie["precipitation"].round(1)
 serie["RAJADA (KM/H)"] = serie["wind_gusts_10m"].round(0)
-serie["TROVOADA (%)"] = serie["thunderstorm_probability"].round(0)
 serie["RAIOS (0–100)"] = serie["raios_score"].round(0)
 serie["CLASSE"] = serie["raios_classe"]
-tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", "TROVOADA (%)", "RAIOS (0–100)", "CLASSE"]]
+tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", "RAIOS (0–100)", "CLASSE"]]
 st.dataframe(tabela, use_container_width=True, hide_index=True)
 st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-st.caption("Fonte de previsão: Open-Meteo (GFS/ECMWF). Observação recente de descargas: GLM/GOES-19. O indicador holístico combina previsão e observação recente; não é uma probabilidade estatística calibrada de raios.")
+st.caption("Fonte de previsão: Open-Meteo/ECMWF. Observação recente de descargas: GLM/GOES-19. O indicador holístico combina previsão e observação recente; não é uma probabilidade estatística calibrada de raios.")
