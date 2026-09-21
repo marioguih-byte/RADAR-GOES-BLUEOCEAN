@@ -1,25 +1,25 @@
 # RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
-Aplicação Streamlit de previsão de curtíssimo prazo usando uma única consulta DWD ICON via Open-Meteo.
+Versão Weatherbit.
 
-- Precipitação: ICON
-- Rajada de vento: ICON
-- Potencial heurístico de raios: ICON (weather_code, CAPE, showers, precipitation probability, umidade e nebulosidade)
-- Grade fixa: 0,5°
-- Região fixa: ±2,5°
-- IDW fixo: potência 4,0
-- Horizonte: até +6 h
-- Um único request por atualização, com cache de 30 minutos
-- Fallback para `/v1/forecast?models=icon_global` somente se o endpoint DWD ICON retornar erro temporário
+## O que precisa
+Crie uma conta Weatherbit e obtenha uma API key.
+No Streamlit Cloud, coloque:
 
-## Executar
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+WEATHERBIT_API_KEY = "SUA_CHAVE"
 
-O índice de raios é um indicador heurístico e não deve ser interpretado como probabilidade estatística calibrada de descarga.
+em **Manage app → Settings → Secrets**.
 
+## Recursos
+- 40 unidades em ordem alfabética.
+- Região fixa em ±2,5°.
+- Grade visual fixa em 0,5°.
+- IDW fixo, potência 4.
+- Precipitação, rajada e potencial de raios.
+- Previsão horária de 0 a +6 h.
+- Navegação por botões de hora.
+- Weatherbit Current Lightning, quando disponível no plano.
+- Download CSV.
 
-## Otimização contra HTTP 429
-A consulta espacial usa 9 pontos (3x3) por região, cache de 1 hora e fallback automático para ICON Global/ponto único quando o servidor limita temporariamente a origem.
+## Limitação importante
+A API Hourly é por ponto. Esta implementação consulta 9 pontos da região e faz IDW. No plano gratuito da Weatherbit, a documentação informa 50 requests/dia e 1 request/s; por isso a aplicação usa consultas sequenciais com pequena espera e cache. A Current Lightning API consome quota adicional e pode depender do plano.
