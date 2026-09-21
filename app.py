@@ -1,5 +1,6 @@
 import re
 import unicodedata
+import time
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ MAX_HOURS = 6
 TZ = "America/Sao_Paulo"
 CACHE_TTL = 1800
 REGION_HALFSPAN = 2.5
+SAMPLE_POINTS_PER_SIDE = 3
 
 st.set_page_config(page_title=SITE_TITLE, page_icon="⚡", layout="wide")
 
@@ -106,19 +108,36 @@ def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER
     return z.reshape(np.asarray(grid_lat).shape)
 
 def make_plot_grid(lat0, lon0):
-    vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
-    lats = lat0 + vals
-    lons = lon0 + vals
-    return np.meshgrid(lats, lons, indexing='ij')
+    """Pontos realmente consultados no ICON: grade 3x3 cobrindo toda a região."""
+    offsets = np.linspace(-REGION_HALFSPAN, REGION_HALFSPAN, SAMPLE_POINTS_PER_SIDE)
+    lats, lons = np.meshgrid(lat0 + offsets, lon0 + offsets, indexing="ij")
+    return lats, lons
+
+
+def make_map_grid(lat0, lon0):
+    """Grade final visual fixa de 0,5°, usada somente para o IDW."""
+    lats = np.arange(lat0 - REGION_HALFSPAN, lat0 + REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
+    lons = np.arange(lon0 - REGION_HALFSPAN, lon0 + REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
+    return np.meshgrid(lats, lons, indexing="ij")
+
 
 def parse_openmeteo(raw, lats, lons, variable_names):
     items = raw if isinstance(raw, list) else [raw]
+    if len(items) != len(lats):
+        if len(lats) > 1:
+            raise RuntimeError(
+                f"Resposta ICON incompatível: esperados {len(lats)} locais, recebidos {len(items)}."
+            )
     rows = []
     for i, item in enumerate(items):
-        h = item.get('hourly', {})
-        times = h.get('time', [])
+        h = item.get("hourly", {})
+        times = h.get("time", [])
         for j, t in enumerate(times):
-            row = {'lat': float(lats[i]), 'lon': float(lons[i]), 'tempo': pd.Timestamp(t)}
+            row = {
+                "lat": float(lats[i]),
+                "lon": float(lons[i]),
+                "tempo": pd.Timestamp(t),
+            }
             for var in variable_names:
                 vals = h.get(var, [])
                 row[var] = vals[j] if j < len(vals) else np.nan
@@ -126,37 +145,97 @@ def parse_openmeteo(raw, lats, lons, variable_names):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
-def consultar_previsao_icon_global():
-    # Uma única consulta POST para as 40 unidades; trocar a unidade não faz nova requisição.
-    lats = [u[1] for u in UNIDADES]
-    lons = [u[2] for u in UNIDADES]
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=32)
+def consultar_previsao_icon_regiao(ulat, ulon):
+    """Consulta ICON somente para 9 pontos da região selecionada.
+
+    Não consulta as 40 unidades. Se o endpoint específico limitar a origem,
+    tenta o endpoint genérico explicitando models=icon_global e, por último,
+    uma consulta pontual para manter o aplicativo funcional.
+    """
+    lat_grid, lon_grid = make_plot_grid(float(ulat), float(ulon))
+    lats = lat_grid.ravel().tolist()
+    lons = lon_grid.ravel().tolist()
+
     variables = [
-        'precipitation', 'showers', 'wind_gusts_10m', 'cape',
-        'relative_humidity_2m', 'cloud_cover', 'weather_code', 'lightning_potential'
+        "precipitation", "showers", "wind_gusts_10m", "cape",
+        "relative_humidity_2m", "cloud_cover", "weather_code",
+        "lightning_potential",
     ]
-    payload = {
-        'latitude': lats,
-        'longitude': lons,
-        'hourly': variables,
-        'forecast_hours': MAX_HOURS + 1,
-        'timezone': TZ,
-        'wind_speed_unit': 'kmh',
-        'precipitation_unit': 'mm',
-        'temperature_unit': 'celsius',
-        'cell_selection': 'nearest',
+    base_params = {
+        "latitude": ",".join(f"{x:.5f}" for x in lats),
+        "longitude": ",".join(f"{x:.5f}" for x in lons),
+        "hourly": ",".join(variables),
+        "forecast_hours": MAX_HOURS + 1,
+        "timezone": TZ,
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+        "temperature_unit": "celsius",
+        "cell_selection": "nearest",
     }
-    url = 'https://api.open-meteo.com/v1/dwd-icon'
-    headers = {'User-Agent': 'rio-ultra-power-previsoes/3.0'}
-    r = requests.post(url, json=payload, headers=headers, timeout=35)
-    if r.status_code == 429:
-        retry_after = r.headers.get('Retry-After')
-        msg = 'HTTP 429 do Open-Meteo. A aplicação faz uma única consulta POST para as 40 unidades e guarda o resultado em cache por 1 hora.'
-        if retry_after:
-            msg += f' Retry-After informado pelo servidor: {retry_after}s.'
-        raise RuntimeError(msg)
-    r.raise_for_status()
-    return parse_openmeteo(r.json(), lats, lons, variables)
+    headers = {"User-Agent": "rio-ultra-power-previsoes/5.0"}
+
+    # 1) Endpoint próprio do DWD ICON.
+    attempts = [
+        ("https://api.open-meteo.com/v1/dwd-icon", {}),
+        ("https://api.open-meteo.com/v1/forecast", {"models": "icon_global"}),
+    ]
+    ultimo_429 = None
+    for url, extra in attempts:
+        try:
+            params = dict(base_params)
+            params.update(extra)
+            r = requests.get(url, params=params, headers=headers, timeout=22)
+            if r.status_code == 429:
+                ultimo_429 = r
+                continue
+            r.raise_for_status()
+            df = parse_openmeteo(r.json(), lats, lons, variables)
+            if not df.empty:
+                return df
+        except requests.HTTPError as exc:
+            # Só trata 429 como fallback; erros 4xx/5xx reais continuam visíveis.
+            if getattr(exc.response, "status_code", None) == 429:
+                ultimo_429 = exc.response
+                continue
+            raise
+        except requests.RequestException:
+            continue
+
+    # 2) Fallback de emergência: uma única localidade. Isso evita que o site
+    # caia completamente em uma origem que esteja temporariamente limitada.
+    try:
+        single_params = dict(base_params)
+        single_params["latitude"] = f"{float(ulat):.5f}"
+        single_params["longitude"] = f"{float(ulon):.5f}"
+        for url, extra in attempts:
+            params = dict(single_params)
+            params.update(extra)
+            r = requests.get(url, params=params, headers=headers, timeout=22)
+            if r.status_code == 429:
+                continue
+            r.raise_for_status()
+            one = parse_openmeteo(r.json(), [float(ulat)], [float(ulon)], variables)
+            if not one.empty:
+                # Expande o ponto central para uma nuvem 3x3 apenas como
+                # modo de contingência; a execução normal continua usando 9 pontos.
+                parts = []
+                for la, lo in zip(lats, lons):
+                    q = one.copy()
+                    q["lat"] = la
+                    q["lon"] = lo
+                    parts.append(q)
+                return pd.concat(parts, ignore_index=True)
+    except requests.RequestException:
+        pass
+
+    retry = ultimo_429.headers.get("Retry-After") if ultimo_429 is not None else None
+    detalhe = f" Retry-After={retry}s." if retry else ""
+    raise RuntimeError(
+        "O Open-Meteo está limitando temporariamente a origem (HTTP 429)."
+        + detalhe +
+        " A aplicação reduziu a consulta para 9 pontos e tentou o ICON Global e o modo pontual de emergência."
+    )
 
 def calcular_indice_holistico(df):
     """Índice heurístico 0-100 baseado exclusivamente no DWD ICON via Open-Meteo."""
@@ -320,7 +399,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • MAPA 0,5° • IDW FIXO • 40 UNIDADES • 1 CONSULTA POST • DADOS ICON EM CACHE POR 1 H")
+st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • MAPA 0,5° • IDW FIXO • 9 PONTOS REGIONAIS • 1 CONSULTA ICON • DADOS EM CACHE POR 1 H")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -340,10 +419,11 @@ with st.sidebar:
     st.info('DADOS ICON ATUALIZADOS AUTOMATICAMENTE A CADA 1 H')
 
 GLA, GLO = make_plot_grid(ulat, ulon)
+PGLA, PGLO = make_map_grid(ulat, ulon)
 
-with st.spinner('CONSULTANDO DWD ICON • 40 UNIDADES • 1 REQUISIÇÃO...'):
+with st.spinner('CONSULTANDO DWD ICON • 9 PONTOS • 1 REQUISIÇÃO...'):
     try:
-        df = consultar_previsao_icon_global()
+        df = consultar_previsao_icon_regiao(float(ulat), float(ulon))
         df = calcular_indice_holistico(df)
     except Exception as exc:
         st.error(f"ERRO AO CONSULTAR OPEN-METEO / ICON: {type(exc).__name__}: {exc}")
@@ -377,11 +457,6 @@ with c_next:
 when = times[st.session_state.time_index]
 fr = df[df["tempo"] == when].copy()
 
-# Grade de plotagem com 0,5° para preservar o aspecto pixelado.
-plot_lat = np.arange(float(GLO.min()) * 0 + float(GLO.min()), float(GLO.max()) + GRID_STEP * 0.51, GRID_STEP)
-plot_lon = np.arange(float(GLO.min()), float(GLO.max()) + GRID_STEP * 0.51, GRID_STEP)
-# GLA/GLO já formam uma grade regular; usar os próprios centros mantém os pixels originais.
-PGLA, PGLO = GLA.copy(), GLO.copy()
 
 vmax_p = max(8.0, float(np.nanpercentile(df["precipitation"], 98)) if np.isfinite(df["precipitation"]).any() else 8.0)
 vmax_g = max(60.0, float(np.nanpercentile(df["wind_gusts_10m"], 98)) if np.isfinite(df["wind_gusts_10m"]).any() else 60.0)

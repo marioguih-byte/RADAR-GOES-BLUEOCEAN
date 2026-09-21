@@ -19,3 +19,7 @@ streamlit run app.py
 ```
 
 O índice de raios é um indicador heurístico e não deve ser interpretado como probabilidade estatística calibrada de descarga.
+
+
+## Otimização contra HTTP 429
+A consulta espacial usa 9 pontos (3x3) por região, cache de 1 hora e fallback automático para ICON Global/ponto único quando o servidor limita temporariamente a origem.
