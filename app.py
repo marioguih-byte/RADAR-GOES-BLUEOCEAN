@@ -1,4 +1,3 @@
-import time
 import re
 import unicodedata
 
@@ -76,7 +75,7 @@ def normalizar_0_1(x: np.ndarray, low: float, high: float) -> np.ndarray:
     return np.clip((np.asarray(x, dtype=float) - low) / (high - low), 0, 1)
 
 
-def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER, k=24):
+def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER, k=12):
     la = np.asarray(points_lat, dtype=float)
     lo = np.asarray(points_lon, dtype=float)
     va = np.asarray(values, dtype=float)
@@ -85,59 +84,41 @@ def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER
     if va.size == 0:
         return np.full_like(grid_lat, np.nan, dtype=float)
 
-    lat_ref = np.deg2rad(np.nanmean(la))
+    lat_ref = np.deg2rad(float(np.nanmean(la)))
     xp = np.deg2rad(lo) * np.cos(lat_ref) * 6371.0
     yp = np.deg2rad(la) * 6371.0
     xg = np.deg2rad(np.asarray(grid_lon).ravel()) * np.cos(lat_ref) * 6371.0
     yg = np.deg2rad(np.asarray(grid_lat).ravel()) * 6371.0
 
-    out = np.full(xg.size, np.nan, dtype=float)
-    for start in range(0, out.size, 3500):
-        sl = slice(start, start + 3500)
-        d = np.hypot(xg[sl, None] - xp[None, :], yg[sl, None] - yp[None, :])
-        n = min(k, d.shape[1])
-        idx = np.argpartition(d, n - 1, axis=1)[:, :n]
-        dd = np.take_along_axis(d, idx, axis=1)
-        vv = va[idx]
-        exact = dd < 1e-9
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weights = 1.0 / np.maximum(dd, 0.001) ** power
-            z = np.sum(weights * vv, axis=1) / np.sum(weights, axis=1)
-        rows = np.where(exact.any(axis=1))[0]
-        if rows.size:
-            cols = np.argmax(exact[rows], axis=1)
-            z[rows] = vv[rows, cols]
-        out[sl] = z
-    return out.reshape(np.asarray(grid_lat).shape)
-
-
-def make_source_grid(lat0, lon0):
-    """Grade ICON otimizada: 1° entre pontos, cobrindo toda a janela ±2,5°.
-    O mapa final continua sendo interpolado e exibido em 0,5°.
-    """
-    step = 1.0
-    vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + step * 0.51, step)
-    lats = lat0 + vals
-    lons = lon0 + vals
-    return np.meshgrid(lats, lons, indexing="ij")
+    d = np.hypot(xg[:, None] - xp[None, :], yg[:, None] - yp[None, :])
+    n = min(int(k), d.shape[1])
+    idx = np.argpartition(d, n - 1, axis=1)[:, :n]
+    dd = np.take_along_axis(d, idx, axis=1)
+    vv = va[idx]
+    exact = dd < 1e-9
+    with np.errstate(divide='ignore', invalid='ignore'):
+        w = 1.0 / np.maximum(dd, 0.001) ** power
+        z = np.sum(w * vv, axis=1) / np.sum(w, axis=1)
+    rows = np.where(exact.any(axis=1))[0]
+    if rows.size:
+        cols = np.argmax(exact[rows], axis=1)
+        z[rows] = vv[rows, cols]
+    return z.reshape(np.asarray(grid_lat).shape)
 
 def make_plot_grid(lat0, lon0):
-    """Grade final de visualização fixa em 0,5°."""
     vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
     lats = lat0 + vals
     lons = lon0 + vals
-    return np.meshgrid(lats, lons, indexing="ij")
-
-
+    return np.meshgrid(lats, lons, indexing='ij')
 
 def parse_openmeteo(raw, lats, lons, variable_names):
     items = raw if isinstance(raw, list) else [raw]
     rows = []
     for i, item in enumerate(items):
-        h = item.get("hourly", {})
-        times = h.get("time", [])
+        h = item.get('hourly', {})
+        times = h.get('time', [])
         for j, t in enumerate(times):
-            row = {"lat": float(lats[i]), "lon": float(lons[i]), "tempo": pd.Timestamp(t)}
+            row = {'lat': float(lats[i]), 'lon': float(lons[i]), 'tempo': pd.Timestamp(t)}
             for var in variable_names:
                 vals = h.get(var, [])
                 row[var] = vals[j] if j < len(vals) else np.nan
@@ -145,123 +126,89 @@ def parse_openmeteo(raw, lats, lons, variable_names):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
-def consultar_previsao_icon(lats_tuple, lons_tuple):
-    """Uma única chamada ICON Global. Grade-fonte enxuta para evitar 429."""
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
+def consultar_previsao_icon_global():
+    # Uma única consulta POST para as 40 unidades; trocar a unidade não faz nova requisição.
+    lats = [u[1] for u in UNIDADES]
+    lons = [u[2] for u in UNIDADES]
     variables = [
-        "precipitation",
-        "precipitation_probability",
-        "showers",
-        "wind_gusts_10m",
-        "cape",
-        "relative_humidity_2m",
-        "cloud_cover",
-        "weather_code",
+        'precipitation', 'showers', 'wind_gusts_10m', 'cape',
+        'relative_humidity_2m', 'cloud_cover', 'weather_code', 'lightning_potential'
     ]
-    params = {
-        "latitude": ",".join(f"{x:.4f}" for x in lats_tuple),
-        "longitude": ",".join(f"{x:.4f}" for x in lons_tuple),
-        "hourly": ",".join(variables),
-        "forecast_hours": MAX_HOURS + 1,
-        "timezone": TZ,
-        "wind_speed_unit": "kmh",
-        "precipitation_unit": "mm",
-        "temperature_unit": "celsius",
-        "cell_selection": "nearest",
-        "models": "icon_global",
+    payload = {
+        'latitude': lats,
+        'longitude': lons,
+        'hourly': variables,
+        'forecast_hours': MAX_HOURS + 1,
+        'timezone': TZ,
+        'wind_speed_unit': 'kmh',
+        'precipitation_unit': 'mm',
+        'temperature_unit': 'celsius',
+        'cell_selection': 'nearest',
     }
-    url = "https://api.open-meteo.com/v1/forecast"
-    headers = {"User-Agent": "rio-ultra-power-previsoes/2.0"}
-
-    last_429 = None
-    for attempt in range(4):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=25)
-            if r.status_code == 429:
-                last_429 = r
-                retry_after = r.headers.get("Retry-After")
-                if retry_after is not None:
-                    try:
-                        wait = float(retry_after)
-                    except ValueError:
-                        wait = 1.0
-                else:
-                    wait = min(0.8 * (2 ** attempt), 4.0)
-                if attempt < 3:
-                    time.sleep(wait)
-                    continue
-                break
-            r.raise_for_status()
-            return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), variables)
-        except requests.HTTPError:
-            if last_429 is not None and attempt == 3:
-                break
-            if attempt < 3:
-                time.sleep(min(0.8 * (2 ** attempt), 4.0))
-                continue
-            raise
-        except requests.RequestException:
-            if attempt < 3:
-                time.sleep(min(0.5 * (2 ** attempt), 2.0))
-                continue
-            raise
-
-    raise RuntimeError(
-        "O Open-Meteo está recusando temporariamente a requisição por limite de uso (HTTP 429). "
-        "A aplicação faz apenas uma consulta ICON Global por atualização e usa cache de 1 hora. "
-        "Aguarde alguns segundos antes de atualizar novamente."
-    )
-
+    url = 'https://api.open-meteo.com/v1/dwd-icon'
+    headers = {'User-Agent': 'rio-ultra-power-previsoes/3.0'}
+    r = requests.post(url, json=payload, headers=headers, timeout=35)
+    if r.status_code == 429:
+        retry_after = r.headers.get('Retry-After')
+        msg = 'HTTP 429 do Open-Meteo. A aplicação faz uma única consulta POST para as 40 unidades e guarda o resultado em cache por 1 hora.'
+        if retry_after:
+            msg += f' Retry-After informado pelo servidor: {retry_after}s.'
+        raise RuntimeError(msg)
+    r.raise_for_status()
+    return parse_openmeteo(r.json(), lats, lons, variables)
 
 def calcular_indice_holistico(df):
-    """Índice heurístico de potencial de raios usando somente variáveis do ICON."""
-    p = np.clip(df["precipitation"].fillna(0).to_numpy(float), 0, None)
-    pp = np.clip(df["precipitation_probability"].fillna(0).to_numpy(float), 0, 100)
-    showers = np.clip(df["showers"].fillna(0).to_numpy(float), 0, None)
-    cape = np.clip(df["cape"].fillna(0).to_numpy(float), 0, None)
-    rh = np.clip(df["relative_humidity_2m"].fillna(0).to_numpy(float), 0, 100)
-    cloud = np.clip(df["cloud_cover"].fillna(0).to_numpy(float), 0, 100)
-    wc = df["weather_code"].fillna(-1).to_numpy(float).astype(int)
+    """Índice heurístico 0-100 baseado exclusivamente no DWD ICON via Open-Meteo."""
+    p = np.clip(df['precipitation'].fillna(0).to_numpy(float), 0, None)
+    showers = np.clip(df['showers'].fillna(0).to_numpy(float), 0, None)
+    cape = np.clip(df['cape'].fillna(0).to_numpy(float), 0, None)
+    rh = np.clip(df['relative_humidity_2m'].fillna(0).to_numpy(float), 0, 100)
+    cloud = np.clip(df['cloud_cover'].fillna(0).to_numpy(float), 0, 100)
+    lpi = np.clip(df['lightning_potential'].fillna(0).to_numpy(float), 0, None)
+    wc = df['weather_code'].fillna(-1).to_numpy(float).astype(int)
 
-    s_rain = normalizar_0_1(p, 0.2, 8.0) * 100
-    s_showers = normalizar_0_1(showers, 0.15, 6.0) * 100
-    s_cape = normalizar_0_1(cape, 100, 1800) * 100
-    s_rh = normalizar_0_1(rh, 65, 100) * 100
-    s_cloud = normalizar_0_1(cloud, 55, 100) * 100
+    def robust_norm(x):
+        finite = x[np.isfinite(x)]
+        if finite.size < 3:
+            hi = max(float(np.nanmax(x)) if finite.size else 1.0, 1.0)
+            return np.clip(x / hi, 0, 1)
+        lo = float(np.nanpercentile(finite, 50))
+        hi = float(np.nanpercentile(finite, 95))
+        if hi <= lo + 1e-9:
+            hi = lo + 1.0
+        return np.clip((x - lo) / (hi - lo), 0, 1)
 
-    # WMO: 95/96/99 = trovoada. Em caso de trovoada explícita do ICON,
-    # o sinal passa a dominar o índice, evitando subestimações.
-    storm_signal = np.zeros(len(df), dtype=float)
-    storm_signal[np.isin(wc, [95, 96, 99])] = 100.0
-    storm_signal[np.isin(wc, [80, 81, 82])] = 55.0
-    storm_signal[np.isin(wc, [83, 84])] = 65.0
+    s_lpi = robust_norm(lpi)
+    s_cape = robust_norm(cape)
+    s_showers = robust_norm(showers)
+    s_rain = robust_norm(p)
+    s_rh = np.clip((rh - 65.0) / 35.0, 0, 1)
+    s_cloud = np.clip((cloud - 55.0) / 45.0, 0, 1)
+
+    storm = np.zeros(len(df), dtype=float)
+    storm[np.isin(wc, [95, 96, 99])] = 1.0
+    storm[np.isin(wc, [80, 81, 82, 83, 84])] = 0.45
 
     score = (
-        0.38 * storm_signal +
-        0.20 * pp +
-        0.16 * s_showers +
-        0.10 * s_rain +
-        0.09 * s_cape +
+        0.45 * s_lpi +
+        0.22 * storm +
+        0.12 * s_showers +
+        0.08 * s_cape +
+        0.06 * s_rain +
         0.04 * s_rh +
         0.03 * s_cloud
-    )
-
-    # Reforço convectivo: chuva/pancadas acompanhadas de CAPE relevante.
-    synergy = ((showers >= 1.0) & (cape >= 500)).astype(float) * 12.0
-    synergy += ((showers >= 2.0) & (cape >= 900)).astype(float) * 10.0
-    score = np.clip(score + synergy, 0, 100)
-
-    # Para chuva estratiforme sem assinatura convectiva, evita um falso alerta alto.
-    stratiform = (p >= 1.0) & (showers < 0.25) & (storm_signal < 50) & (cape < 250)
-    score[stratiform] *= 0.65
+    ) * 100.0
+    score += ((showers >= 1.0) & (cape >= 500)).astype(float) * 10.0
+    score += ((lpi > 0) & np.isin(wc, [95, 96, 99])).astype(float) * 8.0
+    score = np.clip(score, 0, 100)
 
     classes = np.select(
         [score < 20, score < 40, score < 60, score < 80],
-        ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
-        default="MUITO ALTO",
+        ['MUITO BAIXO', 'BAIXO', 'MODERADO', 'ALTO'],
+        default='MUITO ALTO',
     )
-    return df.assign(raios_score=np.clip(score, 0, 100), raios_classe=classes)
-
+    return df.assign(raios_score=score, raios_classe=classes)
 
 def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode):
     fig = plt.figure(figsize=(7.7, 4.85), dpi=140, facecolor="white")
@@ -373,7 +320,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • MAPA 0,5° • IDW FIXO • AMOSTRAGEM ICON OTIMIZADA • POTENCIAL HOLÍSTICO DE RAIOS • 1 CONSULTA")
+st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • MAPA 0,5° • IDW FIXO • 40 UNIDADES • 1 CONSULTA POST • DADOS ICON EM CACHE POR 1 H")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -390,19 +337,13 @@ with st.sidebar:
     st.markdown(f"**RESOLUÇÃO OPEN-METEO:** {GRID_STEP:.1f}°")
     st.markdown(f"**POTÊNCIA IDW:** FIXA EM {IDW_POWER:.1f}")
     st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
-    if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
-        consultar_previsao_icon.clear()
-        st.session_state.time_index = 0
-        st.rerun()
+    st.info('DADOS ICON ATUALIZADOS AUTOMATICAMENTE A CADA 1 H')
 
-SRC_LAT, SRC_LON = make_source_grid(ulat, ulon)
 GLA, GLO = make_plot_grid(ulat, ulon)
-lats = tuple(SRC_LAT.ravel().tolist())
-lons = tuple(SRC_LON.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO • ICON — {len(lats)} PONTOS-BASE..."):
+with st.spinner('CONSULTANDO DWD ICON • 40 UNIDADES • 1 REQUISIÇÃO...'):
     try:
-        df = consultar_previsao_icon(lats, lons)
+        df = consultar_previsao_icon_global()
         df = calcular_indice_holistico(df)
     except Exception as exc:
         st.error(f"ERRO AO CONSULTAR OPEN-METEO / ICON: {type(exc).__name__}: {exc}")
