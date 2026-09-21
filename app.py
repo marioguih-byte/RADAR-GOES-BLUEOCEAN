@@ -163,54 +163,66 @@ def load_region(ulat, ulon):
         raise RuntimeError(
             "Nenhum ponto WeatherAPI foi retornado.\n" + "\n".join(errors)
         )
-    return pd.concat(frames, ignore_index=True), errors
+    result = pd.concat(frames, ignore_index=True)
+    result = add_lightning_columns(result)
+    return result, errors
 
 
-def lightning_heuristic(df):
-    p = np.clip(df["precipitation"].fillna(0).to_numpy(), 0, None)
-    pop = np.clip(df["pop"].fillna(0).to_numpy(), 0, 100)
-    gust = np.clip(df["gust"].fillna(0).to_numpy(), 0, None)
-    rh = np.clip(df["rh"].fillna(0).to_numpy(), 0, 100)
-    cloud = np.clip(df["clouds"].fillna(0).to_numpy(), 0, 100)
-    code = df["weather_code"].fillna(0).to_numpy()
-    rain_flag = df["will_it_rain"].fillna(0).to_numpy()
-    temp = df["temp_c"].fillna(np.nan).to_numpy()
-    dew = df["dewpoint_c"].fillna(np.nan).to_numpy()
 
-    # WeatherAPI thunderstorm-related condition codes.
-    thunder = np.isin(code, [1087, 1273, 1276, 1279, 1282]).astype(float)
+def add_lightning_columns(df):
+    """Adiciona raios_score e raios_classe ao dataframe sem depender de colunas opcionais."""
+    df = df.copy()
+
+    def num(name, default=0.0):
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").fillna(default).to_numpy(dtype=float)
+        return np.full(len(df), default, dtype=float)
+
+    p = np.clip(num("precipitation"), 0, None)
+    pop = np.clip(num("pop"), 0, 100)
+    gust = np.clip(num("gust"), 0, None)
+    rh = np.clip(num("rh"), 0, 100)
+    clouds = np.clip(num("clouds"), 0, 100)
+    weather_code = num("weather_code")
+    rain_flag = np.clip(num("will_it_rain"), 0, 1)
+    temp = num("temp_c", np.nan)
+    dew = num("dewpoint_c", np.nan)
+
+    # WeatherAPI: 1087 = thundery outbreaks nearby;
+    # 1273/1276 = rain with thunder; 1279/1282 = snow with thunder.
+    thunder = np.isin(weather_code.astype(int), [1087, 1273, 1276, 1279, 1282]).astype(float)
 
     rain_signal = np.clip(p / 8.0, 0, 1)
     pop_signal = pop / 100.0
     gust_signal = np.clip((gust - 30.0) / 45.0, 0, 1)
-    humidity_signal = np.clip((rh - 65.0) / 30.0, 0, 1)
-    cloud_signal = np.clip((cloud - 65.0) / 35.0, 0, 1)
+    moisture_signal = np.clip((rh - 65.0) / 30.0, 0, 1)
+    cloud_signal = np.clip((clouds - 65.0) / 35.0, 0, 1)
 
-    dew_dep = np.where(np.isfinite(temp) & np.isfinite(dew), np.maximum(temp - dew, 0), 10)
-    moisture_signal = np.clip(1.0 - dew_dep / 10.0, 0, 1)
+    dep = np.where(np.isfinite(temp) & np.isfinite(dew), np.maximum(temp - dew, 0), 10.0)
+    dew_signal = np.clip(1.0 - dep / 10.0, 0, 1)
 
-    # Heuristic, not observed lightning probability.
-    score = (
-        0.48 * thunder
-        + 0.17 * rain_signal
+    score = 100.0 * (
+        0.50 * thunder
+        + 0.16 * rain_signal
         + 0.12 * pop_signal
         + 0.08 * rain_flag
         + 0.06 * gust_signal
-        + 0.05 * humidity_signal
-        + 0.03 * cloud_signal
-        + 0.01 * moisture_signal
-    ) * 100.0
-
-    # A thunderstorm condition itself should never be shown as very low.
+        + 0.05 * moisture_signal
+        + 0.02 * cloud_signal
+        + 0.01 * dew_signal
+    )
+    # Presença explícita de trovoada nunca fica nas classes BAIXO/MUITO BAIXO.
     score = np.where(thunder > 0, np.maximum(score, 70.0), score)
     score = np.clip(score, 0, 100)
 
-    classes = np.select(
+    df["raios_score"] = score.astype(float)
+    df["raios_classe"] = np.select(
         [score < 20, score < 40, score < 60, score < 80],
         ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
-        default="MUITO ALTO",
-    )
-    return score, classes
+        default="MUITO ALTO"
+    ).astype(str)
+    return df
+
 
 def idw(values_lat, values_lon, values, grid_lat, grid_lon, power=IDW_POWER):
     plat = np.asarray(values_lat, float)
@@ -236,39 +248,6 @@ def idw(values_lat, values_lon, values, grid_lat, grid_lon, power=IDW_POWER):
         w = 1.0 / np.maximum(d[i], 0.001) ** power
         out[i] = np.sum(w * vals) / np.sum(w)
     return out.reshape(grid_lat.shape)
-
-
-def lightning_heuristic(df):
-    p = np.clip(df["precipitation"].fillna(0).to_numpy(), 0, None)
-    pop = np.clip(df["pop"].fillna(0).to_numpy(), 0, 100)
-    gust = np.clip(df["gust"].fillna(0).to_numpy(), 0, None)
-    rh = np.clip(df["rh"].fillna(0).to_numpy(), 0, 100)
-    clouds = np.clip(df["clouds"].fillna(0).to_numpy(), 0, 100)
-    code = df["weather_code"].fillna(0).to_numpy()
-
-    thunder = np.isin(code, [200, 201, 202]).astype(float)
-    convective_rain = np.clip(p / 8.0, 0, 1)
-    gust_signal = np.clip((gust - 25.0) / 50.0, 0, 1)
-    moist_signal = np.clip((rh - 65.0) / 30.0, 0, 1)
-    cloud_signal = np.clip((clouds - 65.0) / 35.0, 0, 1)
-
-    score = (
-        0.40 * thunder
-        + 0.22 * convective_rain
-        + 0.14 * (pop / 100.0)
-        + 0.10 * gust_signal
-        + 0.08 * moist_signal
-        + 0.06 * cloud_signal
-    ) * 100.0
-    score = np.clip(score, 0, 100)
-
-    classes = np.select(
-        [score < 20, score < 40, score < 60, score < 80],
-        ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
-        default="MUITO ALTO",
-    )
-    return score, classes
-
 
 
 # A WeatherAPI não é usada aqui para desenhar pontos de flashes.
@@ -426,6 +405,10 @@ with b3:
 
 when = times[st.session_state.idx_hora]
 fr = df[df["tempo"] == when].copy()
+
+if "raios_score" not in df.columns or "raios_classe" not in df.columns:
+    df = add_lightning_columns(df)
+    fr = df[df["tempo"] == when].copy()
 
 g_lat, g_lon = region_grid(float(ulat), float(ulon))
 P = idw(fr.lat, fr.lon, fr.precipitation, g_lat, g_lon)
