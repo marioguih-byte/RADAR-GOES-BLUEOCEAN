@@ -1,14 +1,11 @@
-import io
 import re
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import requests
-import h5py
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -254,141 +251,73 @@ def consultar_prob_trovoada_gfs(lats_tuple, lons_tuple):
 
 
 def calcular_indice_holistico(df):
-    p = np.clip(df["precipitation"].fillna(0).to_numpy(float), 0, None)
-    pp = np.clip(df["precipitation_probability"].fillna(0).to_numpy(float), 0, 100)
-    showers = np.clip(df["showers"].fillna(0).to_numpy(float), 0, None)
-    cape = np.clip(df["cape"].fillna(0).to_numpy(float), 0, None)
-    li = df["lifted_index"].fillna(0).to_numpy(float)
-    cin = df["convective_inhibition"].fillna(0).to_numpy(float)
-    rh = np.clip(df["relative_humidity_2m"].fillna(0).to_numpy(float), 0, 100)
-    cloud = np.clip(df["cloud_cover"].fillna(0).to_numpy(float), 0, 100)
-    ld = np.clip(df["lightning_density"].fillna(0).to_numpy(float), 0, None)
-    code = df["weather_code"].fillna(-1).to_numpy(float)
-    glm = np.clip(df["glm_score"].fillna(0).to_numpy(float), 0, 100)
-    tsp = np.clip(df["thunderstorm_probability"].fillna(0).to_numpy(float), 0, 100)
+    """Índice heurístico 0–100 usando exclusivamente variáveis do ICON.
 
-    s_showers = normalizar_0_1(showers, 0.2, 8.0) * 100
-    s_cape = normalizar_0_1(cape, 100, 1800) * 100
-    s_li = normalizar_0_1(-li, 0.0, 5.0) * 100
-    s_rh = normalizar_0_1(rh, 65, 100) * 100
-    s_cloud = normalizar_0_1(cloud, 55, 100) * 100
-    s_cin = (1.0 - normalizar_0_1(cin, 0, 120)) * 100
-    s_prec = normalizar_0_1(p, 0.3, 12) * 100
-    s_code = np.where(np.isin(code.astype(int), [95, 96, 99]), 100.0, 0.0)
+    A ideia é priorizar sinais explícitos de tempestade do ICON e, na ausência
+    desses códigos, combinar chuva convectiva, CAPE, estabilidade, umidade,
+    nebulosidade e rajada para representar potencial de atividade elétrica.
+    """
+    p = np.clip(pd.to_numeric(df["precipitation"], errors="coerce").fillna(0).to_numpy(float), 0, None)
+    pp = np.clip(pd.to_numeric(df["precipitation_probability"], errors="coerce").fillna(0).to_numpy(float), 0, 100)
+    showers = np.clip(pd.to_numeric(df["showers"], errors="coerce").fillna(0).to_numpy(float), 0, None)
+    gust = np.clip(pd.to_numeric(df["wind_gusts_10m"], errors="coerce").fillna(0).to_numpy(float), 0, None)
+    cape = np.clip(pd.to_numeric(df["cape"], errors="coerce").fillna(0).to_numpy(float), 0, None)
+    li = pd.to_numeric(df["lifted_index"], errors="coerce").fillna(0).to_numpy(float)
+    cin = np.clip(pd.to_numeric(df["convective_inhibition"], errors="coerce").fillna(0).to_numpy(float), 0, None)
+    rh = np.clip(pd.to_numeric(df["relative_humidity_2m"], errors="coerce").fillna(0).to_numpy(float), 0, 100)
+    cloud = np.clip(pd.to_numeric(df["cloud_cover"], errors="coerce").fillna(0).to_numpy(float), 0, 100)
+    wx = pd.to_numeric(df["weather_code"], errors="coerce").fillna(-1).to_numpy(float).astype(int)
 
-    # Densidade de raios prevista pelo IFS: normalização robusta por horário.
-    density_score = np.zeros(len(df), dtype=float)
-    if np.isfinite(ld).any() and np.nanmax(ld) > 0:
-        density_score = np.empty(len(df), dtype=float)
-        for t, idx in df.groupby("tempo").groups.items():
-            vals = ld[np.asarray(list(idx), dtype=int)]
-            ref = max(float(np.nanpercentile(vals, 90)), 0.05)
-            density_score[np.asarray(list(idx), dtype=int)] = np.clip(vals / ref * 100.0, 0, 100)
+    def s(x, lo, hi):
+        return np.clip((x-lo)/(hi-lo), 0, 1) * 100
 
-    # Sem GLM futuro, o modelo domina; o GLM atual entra somente no instante 0.
-    model_score = (
-        0.30 * density_score +
-        0.14 * tsp +
-        0.13 * s_showers +
-        0.10 * s_prec +
-        0.08 * pp +
-        0.08 * s_cape +
-        0.05 * s_li +
-        0.04 * s_rh +
-        0.03 * s_cloud +
-        0.02 * s_cin +
-        0.02 * s_code
+    # Sinais do ICON, com maior peso para evidência de convecção.
+    s_storm = np.select(
+        [np.isin(wx, [95]), np.isin(wx, [96, 99])],
+        [82.0, 100.0], default=0.0
     )
-    base_time = pd.Timestamp(df["tempo"].min())
-    lead_h = (pd.to_datetime(df["tempo"]) - base_time).dt.total_seconds().to_numpy() / 3600.0
+    s_showers = s(showers, 0.2, 6.0)
+    s_prec = s(p, 0.3, 10.0)
+    s_cape = s(cape, 100.0, 1800.0)
+    s_li = s(-li, 0.0, 6.0)
+    s_cin = 100.0 - s(cin, 0.0, 100.0)
+    s_rh = s(rh, 68.0, 100.0)
+    s_cloud = s(cloud, 60.0, 100.0)
+    s_gust = s(gust, 30.0, 80.0)
+    s_prob = pp
 
-    # Observação GLM recente influencia fortemente a hora inicial e decai rapidamente.
-    glm_weight = 0.88 * np.exp(-np.maximum(lead_h, 0) / 1.10)
-    score = (1 - glm_weight) * model_score + glm_weight * glm
+    # Potencial convectivo sem depender de observação externa.
+    base = (
+        0.28*s_storm +
+        0.18*s_showers +
+        0.12*s_cape +
+        0.10*s_li +
+        0.08*s_prob +
+        0.07*s_prec +
+        0.06*s_rh +
+        0.04*s_cloud +
+        0.04*s_cin +
+        0.03*s_gust
+    )
 
-    counts = df["glm_flashes_10min"].fillna(0).to_numpy(float)
-    current = lead_h <= 0.51
-    floors = [(30,90),(15,80),(8,65),(4,50),(2,35),(1,20)]
-    for threshold, floor in floors:
-        mask = current & (counts >= threshold)
-        score[mask] = np.maximum(score[mask], floor)
+    # Reforça situações em que o ICON indica explicitamente trovoada.
+    explicit = s_storm > 0
+    base[explicit] = np.maximum(base[explicit], s_storm[explicit])
+
+    # Reforça convecção intensa mesmo quando o código meteorológico ainda não
+    # virou 95/96/99: chuva convectiva + CAPE + umidade elevada.
+    conv = (showers >= 1.0) & (cape >= 600.0) & (rh >= 70.0)
+    base[conv] = np.maximum(base[conv], np.minimum(95.0, base[conv] + 18.0))
+
     return df.assign(
-        raios_score=np.clip(score, 0, 100),
+        raios_score=np.clip(base, 0, 100),
         raios_classe=np.select(
-            [score < 20, score < 40, score < 60, score < 80],
+            [base < 20, base < 40, base < 60, base < 80],
             ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
             default="MUITO ALTO",
         ),
     )
 
-def _parse_s3_key_time(key):
-    m = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})", key)
-    if not m:
-        return None
-    year, doy, hh, mm, ss = map(int, m.groups())
-    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy-1, hours=hh, minutes=mm, seconds=ss)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def consultar_glm_10min(unit_lat, unit_lon, halfspan=REGION_HALFSPAN):
-    """Atividade GLM recente + posição dos flashes para mapa e unidade."""
-    now = datetime.now(timezone.utc)
-    prefixes = [f"GLM-L2-LCFA/{now:%Y}/{now.timetuple().tm_yday:03d}/{now:%H}/"]
-    if (now - timedelta(minutes=10)).hour != now.hour:
-        h = now - timedelta(hours=1)
-        prefixes.append(f"GLM-L2-LCFA/{h:%Y}/{h.timetuple().tm_yday:03d}/{h:%H}/")
-
-    keys=[]
-    for prefix in prefixes:
-        try:
-            r=requests.get("https://noaa-goes19.s3.amazonaws.com/",params={"list-type":"2","prefix":prefix,"max-keys":1000},timeout=20)
-            r.raise_for_status()
-            keys += re.findall(r"<Key>([^<]*GLM-L2-LCFA[^<]*)</Key>",r.text)
-        except Exception:
-            pass
-    cutoff=now-timedelta(minutes=GLM_WINDOW_MIN)
-    selected=[]
-    for key in keys:
-        t=_parse_s3_key_time(key)
-        if t is not None and cutoff<=t<=now+timedelta(seconds=30):
-            selected.append((t,key))
-    selected=sorted(selected)[-36:]
-    if not selected:
-        return 0,0,"GLM SEM DADOS",np.array([]),np.array([])
-
-    def fetch(item):
-        _,key=item
-        try:
-            rr=requests.get(f"https://noaa-goes19.s3.amazonaws.com/{key}",timeout=30)
-            rr.raise_for_status()
-            with h5py.File(io.BytesIO(rr.content),"r") as ds:
-                if "flash_lat" not in ds or "flash_lon" not in ds:
-                    return np.array([]),np.array([]),False
-                la=np.asarray(ds["flash_lat"][:],dtype=float)
-                lo=np.asarray(ds["flash_lon"][:],dtype=float)
-            good=np.isfinite(la)&np.isfinite(lo)
-            return la[good],lo[good],True
-        except Exception:
-            return np.array([]),np.array([]),False
-
-    lats=[]; lons=[]; ok=0
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs=[ex.submit(fetch,item) for item in selected]
-        for fut in as_completed(futs):
-            la,lo,good=fut.result()
-            if good:
-                ok+=1
-                if la.size:
-                    lats.append(la); lons.append(lo)
-    if not lats:
-        return 0,ok,"GLM SEM FLASHES",np.array([]),np.array([])
-    fla=np.concatenate(lats); flo=np.concatenate(lons)
-    lat0=np.deg2rad(float(unit_lat))
-    dx=(flo-float(unit_lon))*111.32*np.cos(lat0)
-    dy=(fla-float(unit_lat))*111.32
-    count=int(np.count_nonzero(dx*dx+dy*dy <= 75.0**2))
-    score=float(100.0*(1.0-np.exp(-count/12.0)))
-    return count,ok,f"GLM OK • {ok} arquivos",fla,flo
 
 def classe_cor(classe):
     return {
@@ -401,18 +330,25 @@ def classe_cor(classe):
 
 
 def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode):
-    fig = plt.figure(figsize=(7.7, 4.85), dpi=140, facecolor="white")
+    fig = plt.figure(figsize=(7.85, 4.90), dpi=145, facecolor="white")
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_facecolor("white")
 
-    # Centros em 0,5° -> bordas explícitas, evitando qualquer faixa vazia.
     d = GRID_STEP / 2.0
-    lat_centers = GLA[:, 0]
-    lon_centers = GLO[0, :]
+    lat_centers = np.asarray(GLA[:, 0], float)
+    lon_centers = np.asarray(GLO[0, :], float)
     lat_edges = np.r_[lat_centers - d, lat_centers[-1] + d]
     lon_edges = np.r_[lon_centers - d, lon_centers[-1] + d]
     x0, x1 = float(lon_edges[0]), float(lon_edges[-1])
     y0, y1 = float(lat_edges[0]), float(lat_edges[-1])
+
+    # O campo nunca fica transparente: valores ausentes recebem zero apenas
+    # na visualização, mantendo a escala e o preenchimento integral do quadro.
+    field = np.asarray(field, float)
+    field = np.where(np.isfinite(field), field, 0.0)
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
     ax.set_extent([x0, x1, y0, y1], crs=ccrs.PlateCarree())
     ax.set_aspect("auto")
 
@@ -426,9 +362,9 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
             transform=ccrs.PlateCarree(), edgecolors="none", linewidth=0,
             antialiased=False, rasterized=True, zorder=1,
         )
-        cb = fig.colorbar(pm, ax=ax, pad=0.018, shrink=0.80, ticks=[10, 30, 50, 70, 90])
+        cb = fig.colorbar(pm, ax=ax, pad=0.012, shrink=0.79, ticks=[10, 30, 50, 70, 90])
         cb.ax.set_yticklabels(["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO", "MUITO ALTO"], fontsize=7.0)
-        cb.set_label("POTENCIAL HOLÍSTICO DE RAIOS", fontsize=9)
+        cb.set_label("POTENCIAL DE RAIOS • ICON", fontsize=9)
     else:
         pm = ax.pcolormesh(
             lon_edges, lat_edges, np.clip(field, 0, vmax),
@@ -436,7 +372,7 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
             edgecolors="none", linewidth=0, antialiased=False,
             rasterized=True, zorder=1,
         )
-        cb = fig.colorbar(pm, ax=ax, pad=0.018, shrink=0.80)
+        cb = fig.colorbar(pm, ax=ax, pad=0.012, shrink=0.79)
         cb.set_label(label, fontsize=9)
         cb.ax.tick_params(labelsize=8)
 
@@ -449,43 +385,34 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
     except Exception:
         pass
 
-    lon_ticks = np.arange(np.floor(x0), np.ceil(x1) + 1, 1)
-    lat_ticks = np.arange(np.floor(y0), np.ceil(y1) + 1, 1)
-    if len(lon_ticks) > 8:
-        lon_ticks = np.linspace(x0, x1, 7)
-    if len(lat_ticks) > 8:
-        lat_ticks = np.linspace(y0, y1, 7)
+    lon_ticks = np.arange(np.ceil(x0), np.floor(x1) + 1, 1)
+    lat_ticks = np.arange(np.ceil(y0), np.floor(y1) + 1, 1)
+    if lon_ticks.size < 2:
+        lon_ticks = np.linspace(x0, x1, 6)
+    if lat_ticks.size < 2:
+        lat_ticks = np.linspace(y0, y1, 6)
     ax.set_xticks(lon_ticks, crs=ccrs.PlateCarree())
     ax.set_yticks(lat_ticks, crs=ccrs.PlateCarree())
     ax.xaxis.set_major_formatter(LongitudeFormatter(number_format=".0f", degree_symbol="°"))
     ax.yaxis.set_major_formatter(LatitudeFormatter(number_format=".0f", degree_symbol="°"))
     ax.tick_params(axis="both", labelsize=8, colors="#333", width=0.6)
 
-    # Grade sutil, por cima do preenchimento e sem criar linhas entre pixels.
-    for x in lon_ticks:
-        ax.plot([x, x], [y0, y1], color="#666", linewidth=0.24, alpha=0.20,
-                transform=ccrs.PlateCarree(), zorder=2)
-    for y in lat_ticks:
-        ax.plot([x0, x1], [y, y], color="#666", linewidth=0.24, alpha=0.20,
-                transform=ccrs.PlateCarree(), zorder=2)
-
-    ax.scatter([ulon], [ulat], marker="^", s=120, facecolor="white", edgecolor="black",
+    ax.scatter([ulon], [ulat], marker="^", s=118, facecolor="white", edgecolor="black",
                linewidth=1.8, transform=ccrs.PlateCarree(), zorder=6)
-    ax.scatter([ulon], [ulat], marker="o", s=13, facecolor="black", edgecolor="white",
+    ax.scatter([ulon], [ulat], marker="o", s=12, facecolor="black", edgecolor="white",
                linewidth=0.5, transform=ccrs.PlateCarree(), zorder=7)
 
     ax.set_title(
         f"{unit}\n{pd.Timestamp(when):%d/%m/%Y %H:%M} LOCAL • {title}",
-        fontsize=11.5, fontweight="bold", color="#171717", pad=7,
+        fontsize=11.2, fontweight="bold", color="#171717", pad=7,
     )
     try:
         ax.spines["geo"].set_edgecolor("#222")
         ax.spines["geo"].set_linewidth(0.8)
     except Exception:
         pass
-    fig.subplots_adjust(left=0.035, right=0.915, bottom=0.055, top=0.875)
+    fig.subplots_adjust(left=0.055, right=0.91, bottom=0.08, top=0.85)
     return fig
-
 
 st.markdown(
     """
@@ -510,7 +437,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO ICON + ECMWF + GFS • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -529,8 +456,7 @@ with st.sidebar:
     st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
     if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
         consultar_previsao_icon.clear()
-        consultar_prob_trovoada_gfs.clear()
-        consultar_glm_10min.clear()
+        consultar_previsao_icon.clear()
         st.session_state.time_index = 0
         st.rerun()
 
@@ -538,75 +464,14 @@ GLA, GLO = make_grid(ulat, ulon)
 lats = tuple(GLA.ravel().tolist())
 lons = tuple(GLO.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO ICON + ECMWF + GFS + GLM — {len(lats)} PONTOS..."):
+with st.spinner(f"CONSULTANDO OPEN-METEO / ICON — {len(lats)} PONTOS..."):
     try:
-        # ICON é a fonte principal para precipitação e rajadas.
+        # Uma única consulta regional ao DWD ICON: precipitação, rajadas e
+        # todas as variáveis utilizadas no potencial de raios.
         df = consultar_previsao_icon(lats, lons)
-
-        # ECMWF: densidade prevista de raios.
-        try:
-            df_ecmwf = consultar_raios_ecmwf(lats, lons)
-            df = df.merge(
-                df_ecmwf[["lat", "lon", "tempo", "lightning_density"]],
-                on=["lat", "lon", "tempo"], how="left"
-            )
-        except Exception:
-            df["lightning_density"] = np.nan
-
-        # GFS: probabilidade de trovoada.
-        try:
-            df_gfs = consultar_prob_trovoada_gfs(lats, lons)
-            df = df.merge(
-                df_gfs[["lat", "lon", "tempo", "thunderstorm_probability"]],
-                on=["lat", "lon", "tempo"], how="left"
-            )
-        except Exception:
-            df["thunderstorm_probability"] = np.nan
-
-        # GLM apenas como observação do estado atual. Os flashes não são desenhados.
-        glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
-        glm_lat, glm_lon = np.array([]), np.array([])
-        try:
-            glm_unit_count, glm_files_ok, glm_status, glm_lat, glm_lon = consultar_glm_10min(ulat, ulon)
-        except Exception as exc:
-            glm_status = f"GLM INDISPONÍVEL • {type(exc).__name__}"
-
-        base_t = pd.Timestamp(df["tempo"].min())
-        df["glm_flashes_10min"] = 0.0
-        df["glm_score"] = 0.0
-
-        # O GLM entra no índice, mas não é plotado como pontos.
-        if glm_lat.size:
-            lat_centers = np.unique(GLA[:, 0])
-            lon_centers = np.unique(GLO[0, :])
-            bi = np.clip(np.rint((glm_lat - lat_centers[0]) / GRID_STEP).astype(int), 0, len(lat_centers)-1)
-            bj = np.clip(np.rint((glm_lon - lon_centers[0]) / GRID_STEP).astype(int), 0, len(lon_centers)-1)
-            key_counts = {}
-            for ii, jj in zip(bi, bj):
-                key = (float(lat_centers[ii]), float(lon_centers[jj]))
-                key_counts[key] = key_counts.get(key, 0) + 1
-            base_mask = df["tempo"] == base_t
-            for (la0, lo0), cnt in key_counts.items():
-                msk = base_mask & np.isclose(df["lat"], la0) & np.isclose(df["lon"], lo0)
-                if msk.any():
-                    df.loc[msk, "glm_flashes_10min"] = float(cnt)
-                    df.loc[msk, "glm_score"] = float(100.0 * (1.0 - np.exp(-cnt / 3.0)))
-        else:
-            base_mask = df["tempo"] == base_t
-
-        base_map = {(float(r.lat), float(r.lon)): float(r.glm_score) for r in df[base_mask].itertuples()}
-        base_count = {(float(r.lat), float(r.lon)): float(r.glm_flashes_10min) for r in df[base_mask].itertuples()}
-        for idx, row in df.iterrows():
-            key = (float(row["lat"]), float(row["lon"]))
-            if row["tempo"] != base_t:
-                lead = (pd.Timestamp(row["tempo"]) - base_t).total_seconds()/3600.0
-                decay = np.exp(-max(lead, 0)/1.1)
-                df.at[idx, "glm_score"] = base_map.get(key, 0.0) * decay
-                df.at[idx, "glm_flashes_10min"] = base_count.get(key, 0.0) * decay
-
         df = calcular_indice_holistico(df)
     except Exception as exc:
-        st.error(f"ERRO AO CONSULTAR OPEN-METEO ICON/ECMWF/GFS/GLM: {type(exc).__name__}: {exc}")
+        st.error(f"ERRO AO CONSULTAR OPEN-METEO / ICON: {type(exc).__name__}: {exc}")
         st.stop()
 
 # Tempos horários 0h ... +6h.
@@ -651,13 +516,13 @@ T1, T2, T3 = st.tabs(["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POT
 with T1:
     field = idw_grid(fr.lat, fr.lon, fr["precipitation"], PGLA, PGLO)
     fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "PRECIPITAÇÃO • ICON", "PRECIPITAÇÃO (MM/H)", vmax_p, "turbo", "normal")
-    st.pyplot(fig, use_container_width=False)
+    st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
 with T2:
     field = idw_grid(fr.lat, fr.lon, fr["wind_gusts_10m"], PGLA, PGLO)
     fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "RAJADA DE VENTO • ICON", "RAJADA (KM/H)", vmax_g, "magma", "normal")
-    st.pyplot(fig, use_container_width=False)
+    st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
 with T3:
@@ -666,7 +531,7 @@ with T3:
         PGLA, PGLO, field, unidade_nome, ulat, ulon, when,
         "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios"
     )
-    st.pyplot(fig, use_container_width=False)
+    st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
 # Valor na unidade e contexto ao redor.
@@ -682,17 +547,15 @@ st.subheader("CONDIÇÕES NA UNIDADE")
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("PRECIPITAÇÃO", f"{float(unit_row['precipitation']):.1f} MM/H")
 c2.metric("RAJADA", f"{float(unit_row['wind_gusts_10m']):.0f} KM/H")
-tp = unit_row['thunderstorm_probability']
-c3.metric("PROB. TROVOADA", "N/D" if pd.isna(tp) else f"{float(tp):.0f}%")
-c4.metric("RAIOS GLM • 10 MIN", f"{int(glm_unit_count)}")
+tp = unit_row['precipitation_probability']
+c3.metric("PROB. CHUVA", "N/D" if pd.isna(tp) else f"{float(tp):.0f}%")
+c4.metric("CAPE", f"{float(unit_row['cape']):.0f} J/KG")
 c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
 
 color = classe_cor(unit_class)
-
-st.caption(f"GLM: {glm_status} • {glm_files_ok} arquivos processados • atividade dos últimos 10 min • área local de 75 km")
 st.markdown(
     f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
-    f'<div class="lightning-sub">O índice combina densidade de raios prevista pelo ECMWF, chuva/pancadas, CAPE, Lifted Index, umidade, nebulosidade e outros sinais convectivos. A atividade recente do GLM do GOES-19 entra como observação no horário atual para corrigir tempestades já em andamento.</div>'
+    f'<div class="lightning-sub">O índice usa somente o ICON: código de tempo com trovoada, precipitação e pancadas, CAPE, Lifted Index, inibição convectiva, probabilidade de chuva, umidade, nebulosidade e rajadas.</div>'
     f'<div class="legend-row">'
     f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
     f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
@@ -718,4 +581,4 @@ tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", 
 st.dataframe(tabela, use_container_width=True, hide_index=True)
 st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-st.caption("PRECIPITAÇÃO E RAJADAS: OPEN-METEO/DWD ICON. RAIOS: ICON + ECMWF + GFS + GLM RECENTE. O ÍNDICE É HEURÍSTICO E NÃO REPRESENTA UMA PROBABILIDADE ESTATÍSTICA CALIBRADA.")
+st.caption("PRECIPITAÇÃO, RAJADAS E ÍNDICE DE RAIOS: OPEN-METEO / DWD ICON. O ÍNDICE DE RAIOS É HEURÍSTICO E NÃO REPRESENTA UMA PROBABILIDADE ESTATÍSTICA CALIBRADA.")
