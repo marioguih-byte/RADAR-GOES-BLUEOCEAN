@@ -1,19 +1,21 @@
 # RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
-Aplicação Streamlit para monitoramento de precipitação com IMERG Early Run, GOES-19 RRQPEF, nowcast lagrangiano e previsão numérica pontual.
+Dashboard Streamlit com dados meteorológicos exclusivamente da API Open-Meteo.
 
-## Interface
-- Tema geral do Streamlit em preto.
-- Mapa meteorológico com Cartopy e fundo branco.
-- Mapa reduzido e centralizado na tela.
-- Visualização padrão em GIF animado.
-- Alternativa de visualização quadro a quadro com linha do tempo e botões de navegação.
-
-## Dependências
-O `requirements.txt` inclui h5py, cftime, Cartopy e Pillow para leitura dos arquivos HDF5/netCDF e geração do GIF.
+## Inclui
+- Precipitação horária
+- Rajada de vento a 10 m
+- Índice heurístico de previsão de raios
+- Horizonte de 1 a 6 horas
+- Interpolação IDW espacial
+- Cartopy para costa, fronteiras e estados
+- 40 unidades Petrobras
+- Tabela e download CSV
 
 ## Execução
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+O índice de raios é heurístico e combina precipitação, probabilidade de precipitação, CAPE, índice de levantamento e rajadas. Não representa detecção de descargas.
