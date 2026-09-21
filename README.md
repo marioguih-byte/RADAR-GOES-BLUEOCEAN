@@ -1,32 +1,26 @@
 # RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
-Dashboard Streamlit usando exclusivamente a API Open-Meteo.
+Dashboard Streamlit usando Open-Meteo/DWD ICON para previsão e GLM do GOES-19 para observação recente de raios.
 
 ## Recursos
 - Precipitação horária.
-- Rajada de vento a 10 m.
+- Rajada de vento.
 - Potencial holístico de raios.
+- GLM do GOES-19 nos últimos 10 minutos para reforçar o diagnóstico do horário atual.
 - Horizonte de 0 a +6 horas.
-- Grade de consulta Open-Meteo fixa em 0,5°.
-- Potência IDW fixa em 4,0.
-- Campo espacial pixelado com `pcolormesh` sem linhas entre as células.
+- Grade fixa de 0,5°.
+- IDW fixo em potência 4,0.
+- Campo espacial pixelado com pcolormesh.
 - Cartopy para costa, fronteiras e estados.
-- Setas para navegar entre as horas.
+- Setas de navegação entre horas.
 - 40 unidades em ordem alfabética.
-- Download CSV da previsão horária.
+- Download CSV.
 
-## Potencial holístico de raios
-O índice combina a probabilidade de trovoada do Open-Meteo com a densidade de raios modelada pelo ECMWF disponibilizada pelo Open-Meteo, além de precipitação convectiva, CAPE, Lifted Index, probabilidade de precipitação, umidade e cobertura de nuvens.
+## GLM
+Os flashes GLM-L2-LCFA do GOES-19 são lidos diretamente do bucket público `noaa-goes19` da NOAA/AWS. Os flashes não são desenhados como pontos; são agregados espacialmente e usados para reforçar o campo de potencial elétrico do horário atual.
 
-Ele é um indicador de potencial previsto, não uma observação/detecção de descargas em tempo real.
-
-## Executar
+## Execução
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-
-## Raios
-
-A versão atual combina previsão do Open-Meteo (GFS/ECMWF) com observação recente do GLM do GOES-19. O GLM-L2-LCFA fornece flashes individuais com centroides geográficos; a aplicação conta os flashes dos últimos 10 minutos em um raio de 75 km da unidade e usa essa observação para corrigir o horário corrente e alimentar um decaimento de curto prazo.
