@@ -1,3 +1,4 @@
+import time
 import re
 import unicodedata
 
@@ -110,18 +111,23 @@ def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER
     return out.reshape(np.asarray(grid_lat).shape)
 
 
-def make_grid(lat0, lon0):
-    """Grade espacial fixa de 0,5° com 11 x 11 pontos (±2,5°)."""
+def make_source_grid(lat0, lon0):
+    """Grade ICON otimizada: 1° entre pontos, cobrindo toda a janela ±2,5°.
+    O mapa final continua sendo interpolado e exibido em 0,5°.
+    """
+    step = 1.0
+    vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + step * 0.51, step)
+    lats = lat0 + vals
+    lons = lon0 + vals
+    return np.meshgrid(lats, lons, indexing="ij")
+
+def make_plot_grid(lat0, lon0):
+    """Grade final de visualização fixa em 0,5°."""
     vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
     lats = lat0 + vals
     lons = lon0 + vals
     return np.meshgrid(lats, lons, indexing="ij")
 
-
-def batches(seq: Iterable, size: int):
-    seq = list(seq)
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
 
 
 def parse_openmeteo(raw, lats, lons, variable_names):
@@ -139,13 +145,12 @@ def parse_openmeteo(raw, lats, lons, variable_names):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=100)
 def consultar_previsao_icon(lats_tuple, lons_tuple):
-    """Única consulta meteorológica da aplicação: DWD ICON Global via Open-Meteo."""
+    """Uma única chamada ICON Global. Grade-fonte enxuta para evitar 429."""
     variables = [
         "precipitation",
         "precipitation_probability",
-        "rain",
         "showers",
         "wind_gusts_10m",
         "cape",
@@ -154,58 +159,58 @@ def consultar_previsao_icon(lats_tuple, lons_tuple):
         "weather_code",
     ]
     params = {
-        "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
-        "longitude": ",".join(f"{x:.5f}" for x in lons_tuple),
+        "latitude": ",".join(f"{x:.4f}" for x in lats_tuple),
+        "longitude": ",".join(f"{x:.4f}" for x in lons_tuple),
         "hourly": ",".join(variables),
         "forecast_hours": MAX_HOURS + 1,
-        "past_hours": 0,
         "timezone": TZ,
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
         "temperature_unit": "celsius",
-        "cell_selection": "land",
+        "cell_selection": "nearest",
+        "models": "icon_global",
     }
+    url = "https://api.open-meteo.com/v1/forecast"
+    headers = {"User-Agent": "rio-ultra-power-previsoes/2.0"}
 
-    session = requests.Session()
-    headers = {"User-Agent": "rio-ultra-power-previsoes/1.0"}
-
-    # 1 tentativa no endpoint ICON; se houver 429, espera o Retry-After curto.
-    for url in ("https://api.open-meteo.com/v1/dwd-icon", "https://api.open-meteo.com/v1/forecast"):
-        params_use = dict(params)
-        if url.endswith("/forecast"):
-            params_use["models"] = "icon_global"
-        for attempt in range(2):
-            try:
-                r = session.get(url, params=params_use, headers=headers, timeout=35)
-                if r.status_code == 429:
-                    retry_after = r.headers.get("Retry-After")
+    last_429 = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=25)
+            if r.status_code == 429:
+                last_429 = r
+                retry_after = r.headers.get("Retry-After")
+                if retry_after is not None:
                     try:
-                        wait = min(max(float(retry_after), 0.5), 3.0) if retry_after is not None else 1.5
-                    except Exception:
-                        wait = 2.0
-                    if attempt == 0:
-                        import time
-                        time.sleep(wait)
-                        continue
-                r.raise_for_status()
-                data = r.json()
-                return parse_openmeteo(data, list(lats_tuple), list(lons_tuple), variables)
-            except requests.HTTPError:
-                if r.status_code == 429 and attempt == 0:
+                        wait = float(retry_after)
+                    except ValueError:
+                        wait = 1.0
+                else:
+                    wait = min(0.8 * (2 ** attempt), 4.0)
+                if attempt < 3:
+                    time.sleep(wait)
                     continue
-                if url.endswith("/dwd-icon"):
-                    break
-                raise
-            except Exception:
-                if attempt == 0:
-                    import time
-                    time.sleep(0.5)
-                    continue
-                if url.endswith("/dwd-icon"):
-                    break
-                raise
+                break
+            r.raise_for_status()
+            return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), variables)
+        except requests.HTTPError:
+            if last_429 is not None and attempt == 3:
+                break
+            if attempt < 3:
+                time.sleep(min(0.8 * (2 ** attempt), 4.0))
+                continue
+            raise
+        except requests.RequestException:
+            if attempt < 3:
+                time.sleep(min(0.5 * (2 ** attempt), 2.0))
+                continue
+            raise
 
-    raise RuntimeError("O Open-Meteo recusou a consulta por limite temporário (HTTP 429). A aplicação tentou o endpoint ICON e o fallback ICON Global sem fazer consultas adicionais de dados.")
+    raise RuntimeError(
+        "O Open-Meteo está recusando temporariamente a requisição por limite de uso (HTTP 429). "
+        "A aplicação faz apenas uma consulta ICON Global por atualização e usa cache de 1 hora. "
+        "Aguarde alguns segundos antes de atualizar novamente."
+    )
 
 
 def calcular_indice_holistico(df):
@@ -368,7 +373,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS • 1 CONSULTA")
+st.caption("OPEN-METEO • DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • MAPA 0,5° • IDW FIXO • AMOSTRAGEM ICON OTIMIZADA • POTENCIAL HOLÍSTICO DE RAIOS • 1 CONSULTA")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -390,11 +395,12 @@ with st.sidebar:
         st.session_state.time_index = 0
         st.rerun()
 
-GLA, GLO = make_grid(ulat, ulon)
-lats = tuple(GLA.ravel().tolist())
-lons = tuple(GLO.ravel().tolist())
+SRC_LAT, SRC_LON = make_source_grid(ulat, ulon)
+GLA, GLO = make_plot_grid(ulat, ulon)
+lats = tuple(SRC_LAT.ravel().tolist())
+lons = tuple(SRC_LON.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO • ICON — {len(lats)} PONTOS..."):
+with st.spinner(f"CONSULTANDO OPEN-METEO • ICON — {len(lats)} PONTOS-BASE..."):
     try:
         df = consultar_previsao_icon(lats, lons)
         df = calcular_indice_holistico(df)
