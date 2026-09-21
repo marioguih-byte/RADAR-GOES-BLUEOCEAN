@@ -757,19 +757,23 @@ def render_forecast_fragment():
     c_prev, c_hour, c_next = st.columns([1, 2, 1])
     with c_prev:
         if st.button("◀ HORA ANTERIOR", use_container_width=True, disabled=st.session_state.time_index == 0, key="prev_hour"):
-            st.session_state.time_index -= 1
-    with c_hour:
-        st.markdown(
-            f'<div class="nav-hour"><div class="main">{pd.Timestamp(times[st.session_state.time_index]):%d/%m/%Y %H:%M}</div>'
-            f'<div class="sub">HORA {st.session_state.time_index:+d} • LOCAL</div></div>',
-            unsafe_allow_html=True,
-        )
+            st.session_state.time_index = max(0, int(st.session_state.time_index) - 1)
     with c_next:
         if st.button("PRÓXIMA HORA ▶", use_container_width=True, disabled=st.session_state.time_index == len(times) - 1, key="next_hour"):
-            st.session_state.time_index += 1
+            st.session_state.time_index = min(len(times) - 1, int(st.session_state.time_index) + 1)
 
+    # O índice é atualizado pelos botões antes de desenhar o cabeçalho.
+    # Isso evita o atraso de uma interação em que o mapa já avança, mas
+    # o horário superior ainda mostra a hora anterior.
     current_index = int(st.session_state.time_index)
     when = times[current_index]
+
+    with c_hour:
+        st.markdown(
+            f'<div class="nav-hour"><div class="main">{pd.Timestamp(when):%d/%m/%Y %H:%M}</div>'
+            f'<div class="sub">HORA {current_index:+d} • LOCAL</div></div>',
+            unsafe_allow_html=True,
+        )
     fr = df[df["tempo"] == when].copy()
 
     vmax_p = max(8.0, float(np.nanpercentile(df["precipitation"], 98)) if np.isfinite(df["precipitation"]).any() else 8.0)
