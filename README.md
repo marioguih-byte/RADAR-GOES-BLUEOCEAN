@@ -30,9 +30,3 @@ streamlit run app.py
 ## Raios
 
 A versão atual combina previsão do Open-Meteo (GFS/ECMWF) com observação recente do GLM do GOES-19. O GLM-L2-LCFA fornece flashes individuais com centroides geográficos; a aplicação conta os flashes dos últimos 10 minutos em um raio de 75 km da unidade e usa essa observação para corrigir o horário corrente e alimentar um decaimento de curto prazo.
-
-
-## GLM GOES-19
-A camada GLM usa o produto GLM-L2-LCFA do GOES-19, lido no bucket público `noaa-goes19` da NOAA/AWS. Os arquivos contêm `flash_lat`, `flash_lon` e `flash_energy`. Os flashes não são desenhados individualmente.
-
-No horário atual, os flashes dos últimos 10 minutos são agregados por célula e usados para reforçar o campo de raios. Para +1 a +6 h, o padrão espacial observado é deslocado usando o movimento estimado entre as duas últimas janelas de 10 minutos e recebe decaimento temporal; esse nowcast é combinado ao componente previsto pelo ICON.
