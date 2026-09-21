@@ -116,15 +116,10 @@ def idw_grid(points_lat, points_lon, values, grid_lat, grid_lon, power=IDW_POWER
 
 
 def make_grid(lat0, lon0):
-    """Grade espacial fixa em 0,5° ao redor da unidade."""
-    halfspan = REGION_HALFSPAN
-    step = GRID_STEP
-    lat_min = np.floor((lat0 - halfspan) / step) * step
-    lat_max = np.ceil((lat0 + halfspan) / step) * step
-    lon_min = np.floor((lon0 - halfspan) / step) * step
-    lon_max = np.ceil((lon0 + halfspan) / step) * step
-    lats = np.arange(lat_min, lat_max + step * 0.51, step)
-    lons = np.arange(lon_min, lon_max + step * 0.51, step)
+    """Grade espacial fixa de 0,5° com 11 x 11 pontos (±2,5°)."""
+    vals = np.arange(-REGION_HALFSPAN, REGION_HALFSPAN + GRID_STEP * 0.51, GRID_STEP)
+    lats = lat0 + vals
+    lons = lon0 + vals
     return np.meshgrid(lats, lons, indexing="ij")
 
 
@@ -197,6 +192,37 @@ def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
     raise last
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def consultar_prob_trovoada_gfs(lats_tuple, lons_tuple):
+    """Probabilidade de trovoada do GFS em uma única chamada espacial."""
+    params = {
+        "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
+        "longitude": ",".join(f"{x:.5f}" for x in lons_tuple),
+        "hourly": "thunderstorm_probability",
+        "forecast_hours": MAX_HOURS + 1,
+        "timezone": TZ,
+        "cell_selection": "land",
+    }
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get("https://api.open-meteo.com/v1/gfs", params=params, timeout=60)
+            if r.status_code == 429:
+                import time
+                time.sleep(1.5 * (2 ** attempt))
+                last = RuntimeError(f"HTTP 429 no GFS após tentativa {attempt + 1}")
+                continue
+            r.raise_for_status()
+            raw = r.json()
+            return parse_openmeteo(raw, list(lats_tuple), list(lons_tuple), ["thunderstorm_probability"])
+        except Exception as exc:
+            last = exc
+            if attempt < 2:
+                import time
+                time.sleep(1.0 * (2 ** attempt))
+    raise last
+
+
 def calcular_indice_holistico(df):
     p = np.clip(df["precipitation"].fillna(0).to_numpy(float), 0, None)
     pp = np.clip(df["precipitation_probability"].fillna(0).to_numpy(float), 0, 100)
@@ -209,13 +235,14 @@ def calcular_indice_holistico(df):
     ld = np.clip(df["lightning_density"].fillna(0).to_numpy(float), 0, None)
     code = df["weather_code"].fillna(-1).to_numpy(float)
     glm = np.clip(df["glm_score"].fillna(0).to_numpy(float), 0, 100)
+    tsp = np.clip(df["thunderstorm_probability"].fillna(0).to_numpy(float), 0, 100)
 
     s_showers = normalizar_0_1(showers, 0.2, 8.0) * 100
     s_cape = normalizar_0_1(cape, 100, 1800) * 100
     s_li = normalizar_0_1(-li, 0.0, 5.0) * 100
     s_rh = normalizar_0_1(rh, 65, 100) * 100
     s_cloud = normalizar_0_1(cloud, 55, 100) * 100
-    s_cin = normalizar_0_1(-cin, 0, 120) * 100
+    s_cin = (1.0 - normalizar_0_1(cin, 0, 120)) * 100
     s_prec = normalizar_0_1(p, 0.3, 12) * 100
     s_code = np.where(np.isin(code.astype(int), [95, 96, 99]), 100.0, 0.0)
 
@@ -230,10 +257,11 @@ def calcular_indice_holistico(df):
 
     # Sem GLM futuro, o modelo domina; o GLM atual entra somente no instante 0.
     model_score = (
-        0.38 * density_score +
-        0.16 * s_showers +
-        0.12 * s_prec +
-        0.10 * pp +
+        0.30 * density_score +
+        0.14 * tsp +
+        0.13 * s_showers +
+        0.10 * s_prec +
+        0.08 * pp +
         0.08 * s_cape +
         0.05 * s_li +
         0.04 * s_rh +
@@ -245,7 +273,7 @@ def calcular_indice_holistico(df):
     lead_h = (pd.to_datetime(df["tempo"]) - base_time).dt.total_seconds().to_numpy() / 3600.0
 
     # Observação GLM recente influencia fortemente a hora inicial e decai rapidamente.
-    glm_weight = 0.78 * np.exp(-np.maximum(lead_h, 0) / 1.25)
+    glm_weight = 0.88 * np.exp(-np.maximum(lead_h, 0) / 1.10)
     score = (1 - glm_weight) * model_score + glm_weight * glm
 
     counts = df["glm_flashes_10min"].fillna(0).to_numpy(float)
@@ -272,8 +300,8 @@ def _parse_s3_key_time(key):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def consultar_glm_10min(unit_lat, unit_lon):
-    """Atividade GLM recente apenas para a unidade, com downloads concorrentes."""
+def consultar_glm_10min(unit_lat, unit_lon, halfspan=REGION_HALFSPAN):
+    """Atividade GLM recente + posição dos flashes para mapa e unidade."""
     now = datetime.now(timezone.utc)
     prefixes = [f"GLM-L2-LCFA/{now:%Y}/{now.timetuple().tm_yday:03d}/{now:%H}/"]
     if (now - timedelta(minutes=10)).hour != now.hour:
@@ -296,7 +324,7 @@ def consultar_glm_10min(unit_lat, unit_lon):
             selected.append((t,key))
     selected=sorted(selected)[-36:]
     if not selected:
-        return 0,0,"GLM SEM DADOS"
+        return 0,0,"GLM SEM DADOS",np.array([]),np.array([])
 
     def fetch(item):
         _,key=item
@@ -323,14 +351,14 @@ def consultar_glm_10min(unit_lat, unit_lon):
                 if la.size:
                     lats.append(la); lons.append(lo)
     if not lats:
-        return 0,ok,"GLM SEM FLASHES"
+        return 0,ok,"GLM SEM FLASHES",np.array([]),np.array([])
     fla=np.concatenate(lats); flo=np.concatenate(lons)
     lat0=np.deg2rad(float(unit_lat))
     dx=(flo-float(unit_lon))*111.32*np.cos(lat0)
     dy=(fla-float(unit_lat))*111.32
     count=int(np.count_nonzero(dx*dx+dy*dy <= 75.0**2))
     score=float(100.0*(1.0-np.exp(-count/12.0)))
-    return count,ok,f"GLM OK • {ok} arquivos"
+    return count,ok,f"GLM OK • {ok} arquivos",fla,flo
 
 def classe_cor(classe):
     return {
@@ -342,17 +370,19 @@ def classe_cor(classe):
     }.get(classe, "#777777")
 
 
-def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode):
-    fig = plt.figure(figsize=(7.2, 4.35), dpi=135, facecolor="white")
+def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode, glm_lat=None, glm_lon=None):
+    fig = plt.figure(figsize=(7.7, 4.85), dpi=140, facecolor="white")
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_facecolor("white")
 
-    dlat = GRID_STEP / 2
-    dlon = GRID_STEP / 2
-    x0 = float(GLO.min()) - dlon
-    x1 = float(GLO.max()) + dlon
-    y0 = float(GLA.min()) - dlat
-    y1 = float(GLA.max()) + dlat
+    # Centros em 0,5° -> bordas explícitas, evitando qualquer faixa vazia.
+    d = GRID_STEP / 2.0
+    lat_centers = GLA[:, 0]
+    lon_centers = GLO[0, :]
+    lat_edges = np.r_[lat_centers - d, lat_centers[-1] + d]
+    lon_edges = np.r_[lon_centers - d, lon_centers[-1] + d]
+    x0, x1 = float(lon_edges[0]), float(lon_edges[-1])
+    y0, y1 = float(lat_edges[0]), float(lat_edges[-1])
     ax.set_extent([x0, x1, y0, y1], crs=ccrs.PlateCarree())
 
     if mode == "raios":
@@ -360,21 +390,20 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
         bounds = np.array([0, 20, 40, 60, 80, 100], float)
         norm = BoundaryNorm(bounds, len(colors))
         pm = ax.pcolormesh(
-            GLO, GLA, np.clip(field, 0, 100),
-            cmap=ListedColormap(colors), norm=norm,
-            shading="nearest", transform=ccrs.PlateCarree(),
-            edgecolors="none", linewidth=0, antialiased=False, rasterized=True,
-            zorder=1,
+            lon_edges, lat_edges, np.clip(field, 0, 100),
+            cmap=ListedColormap(colors), norm=norm, shading="flat",
+            transform=ccrs.PlateCarree(), edgecolors="none", linewidth=0,
+            antialiased=False, rasterized=True, zorder=1,
         )
         cb = fig.colorbar(pm, ax=ax, pad=0.018, shrink=0.80, ticks=[10, 30, 50, 70, 90])
-        cb.ax.set_yticklabels(["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO", "MUITO ALTO"], fontsize=7.2)
+        cb.ax.set_yticklabels(["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO", "MUITO ALTO"], fontsize=7.0)
         cb.set_label("POTENCIAL HOLÍSTICO DE RAIOS", fontsize=9)
     else:
         pm = ax.pcolormesh(
-            GLO, GLA, np.clip(field, 0, vmax),
-            cmap=cmap, shading="nearest", transform=ccrs.PlateCarree(),
-            edgecolors="none", linewidth=0, antialiased=False, rasterized=True,
-            zorder=1,
+            lon_edges, lat_edges, np.clip(field, 0, vmax),
+            cmap=cmap, shading="flat", transform=ccrs.PlateCarree(),
+            edgecolors="none", linewidth=0, antialiased=False,
+            rasterized=True, zorder=1,
         )
         cb = fig.colorbar(pm, ax=ax, pad=0.018, shrink=0.80)
         cb.set_label(label, fontsize=9)
@@ -391,35 +420,44 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
 
     lon_ticks = np.arange(np.floor(x0), np.ceil(x1) + 1, 1)
     lat_ticks = np.arange(np.floor(y0), np.ceil(y1) + 1, 1)
-    if len(lon_ticks) > 9:
-        lon_ticks = np.linspace(x0, x1, 8)
-    if len(lat_ticks) > 9:
+    if len(lon_ticks) > 8:
+        lon_ticks = np.linspace(x0, x1, 7)
+    if len(lat_ticks) > 8:
         lat_ticks = np.linspace(y0, y1, 7)
-
     ax.set_xticks(lon_ticks, crs=ccrs.PlateCarree())
     ax.set_yticks(lat_ticks, crs=ccrs.PlateCarree())
     ax.xaxis.set_major_formatter(LongitudeFormatter(number_format=".0f", degree_symbol="°"))
     ax.yaxis.set_major_formatter(LatitudeFormatter(number_format=".0f", degree_symbol="°"))
     ax.tick_params(axis="both", labelsize=8, colors="#333", width=0.6)
 
+    # Grade sutil, por cima do preenchimento e sem criar linhas entre pixels.
     for x in lon_ticks:
-        ax.plot([x, x], [y0, y1], color="#888", linewidth=0.25, alpha=0.22, transform=ccrs.PlateCarree(), zorder=2)
+        ax.plot([x, x], [y0, y1], color="#666", linewidth=0.24, alpha=0.20,
+                transform=ccrs.PlateCarree(), zorder=2)
     for y in lat_ticks:
-        ax.plot([x0, x1], [y, y], color="#888", linewidth=0.25, alpha=0.22, transform=ccrs.PlateCarree(), zorder=2)
+        ax.plot([x0, x1], [y, y], color="#666", linewidth=0.24, alpha=0.20,
+                transform=ccrs.PlateCarree(), zorder=2)
 
-    ax.scatter([ulon], [ulat], marker="^", s=112, facecolor="white", edgecolor="black", linewidth=1.8, transform=ccrs.PlateCarree(), zorder=6)
-    ax.scatter([ulon], [ulat], marker="o", s=14, facecolor="black", edgecolor="white", linewidth=0.5, transform=ccrs.PlateCarree(), zorder=7)
+    ax.scatter([ulon], [ulat], marker="^", s=120, facecolor="white", edgecolor="black",
+               linewidth=1.8, transform=ccrs.PlateCarree(), zorder=6)
+    ax.scatter([ulon], [ulat], marker="o", s=13, facecolor="black", edgecolor="white",
+               linewidth=0.5, transform=ccrs.PlateCarree(), zorder=7)
+
+    if mode == "raios" and glm_lat is not None and len(glm_lat):
+        ax.scatter(glm_lon, glm_lat, marker="+", s=30, linewidths=0.8,
+                   c="#111111", alpha=0.65, transform=ccrs.PlateCarree(),
+                   zorder=8, label="GLM — últimos 10 min")
 
     ax.set_title(
-        f"{unit}\n{pd.Timestamp(when):%d/%m/%Y %H:%M} local • {title}",
-        fontsize=12, fontweight="bold", color="#171717", pad=7,
+        f"{unit}\n{pd.Timestamp(when):%d/%m/%Y %H:%M} LOCAL • {title}",
+        fontsize=11.5, fontweight="bold", color="#171717", pad=7,
     )
     try:
         ax.spines["geo"].set_edgecolor("#222")
         ax.spines["geo"].set_linewidth(0.8)
     except Exception:
         pass
-    fig.subplots_adjust(left=0.06, right=0.91, bottom=0.08, top=0.84)
+    fig.subplots_adjust(left=0.055, right=0.91, bottom=0.075, top=0.86)
     return fig
 
 
@@ -446,7 +484,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO ECMWF • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO ECMWF + GFS • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -465,6 +503,7 @@ with st.sidebar:
     st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
     if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
         consultar_previsao_ecmwf.clear()
+        consultar_prob_trovoada_gfs.clear()
         consultar_glm_10min.clear()
         st.session_state.time_index = 0
         st.rerun()
@@ -476,17 +515,53 @@ lons = tuple(GLO.ravel().tolist())
 with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS..."):
     try:
         df = consultar_previsao_ecmwf(lats, lons)
-        glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
         try:
-            glm_unit_count, glm_files_ok, glm_status = consultar_glm_10min(ulat, ulon)
+            df_gfs = consultar_prob_trovoada_gfs(lats, lons)
+            df = df.merge(
+                df_gfs[["lat", "lon", "tempo", "thunderstorm_probability"]],
+                on=["lat", "lon", "tempo"], how="left"
+            )
+        except Exception:
+            df["thunderstorm_probability"] = np.nan
+        glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
+        glm_lat, glm_lon = np.array([]), np.array([])
+        try:
+            glm_unit_count, glm_files_ok, glm_status, glm_lat, glm_lon = consultar_glm_10min(ulat, ulon)
         except Exception as exc:
             glm_status = f"GLM INDISPONÍVEL • {type(exc).__name__}"
-        df["glm_flashes_10min"] = float(glm_unit_count)
-        df["glm_score"] = float(100.0 * (1.0 - np.exp(-glm_unit_count / 12.0)))
-        # Mantém o valor observado apenas no horário inicial; nos demais horários é zerado.
+
         base_t = pd.Timestamp(df["tempo"].min())
-        df.loc[df["tempo"] != base_t, "glm_flashes_10min"] = 0.0
-        df.loc[df["tempo"] != base_t, "glm_score"] = 0.0
+        df["glm_flashes_10min"] = 0.0
+        df["glm_score"] = 0.0
+
+        # Campo espacial de GLM: conta flashes nos mesmos pixels de 0,5°
+        # usados no mapa, sem suavização. O valor é observado nos últimos 10 min.
+        if glm_lat.size:
+            lat_centers = np.unique(GLA[:, 0])
+            lon_centers = np.unique(GLO[0, :])
+            bi = np.clip(np.rint((glm_lat - lat_centers[0]) / GRID_STEP).astype(int), 0, len(lat_centers)-1)
+            bj = np.clip(np.rint((glm_lon - lon_centers[0]) / GRID_STEP).astype(int), 0, len(lon_centers)-1)
+            key_counts = {}
+            for ii, jj in zip(bi, bj):
+                key_counts[(float(lat_centers[ii]), float(lon_centers[jj]))] = key_counts.get((float(lat_centers[ii]), float(lon_centers[jj])), 0) + 1
+            base_mask = df["tempo"] == base_t
+            for (la0, lo0), cnt in key_counts.items():
+                m = base_mask & (np.isclose(df["lat"], la0)) & (np.isclose(df["lon"], lo0))
+                if m.any():
+                    df.loc[m, "glm_flashes_10min"] = float(cnt)
+                    df.loc[m, "glm_score"] = float(100.0 * (1.0 - np.exp(-cnt / 3.0)))
+
+        # Persiste o padrão espacial observado com decaimento para o nowcast
+        # enquanto o modelo numérico passa a dominar gradualmente.
+        base_map = {(float(r.lat), float(r.lon)): float(r.glm_score) for r in df[base_mask].itertuples()}
+        base_count = {(float(r.lat), float(r.lon)): float(r.glm_flashes_10min) for r in df[base_mask].itertuples()}
+        for idx, row in df.iterrows():
+            key = (float(row["lat"]), float(row["lon"]))
+            if row["tempo"] != base_t:
+                lead = (pd.Timestamp(row["tempo"]) - base_t).total_seconds()/3600.0
+                df.at[idx, "glm_score"] = base_map.get(key, 0.0)
+                df.at[idx, "glm_flashes_10min"] = base_count.get(key, 0.0) * np.exp(-max(lead,0)/1.1)
+
         df = calcular_indice_holistico(df)
     except Exception as exc:
         st.error(f"ERRO AO CONSULTAR OPEN-METEO/GLM: {type(exc).__name__}: {exc}")
@@ -545,7 +620,12 @@ with T2:
 
 with T3:
     field = idw_grid(fr.lat, fr.lon, fr["raios_score"], PGLA, PGLO)
-    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios")
+    fig = mapa_cartopy(
+        PGLA, PGLO, field, unidade_nome, ulat, ulon, when,
+        "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios",
+        glm_lat=glm_lat if when == base_t else None,
+        glm_lon=glm_lon if when == base_t else None
+    )
     st.pyplot(fig, use_container_width=False)
     plt.close(fig)
 
@@ -569,7 +649,7 @@ c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
 
 color = classe_cor(unit_class)
 
-st.caption(f"GLM: {glm_status} • {glm_files_ok} arquivos processados • janela dos últimos 10 min • raio local de 75 km")
+st.caption(f"GLM: {glm_status} • {glm_files_ok} arquivos processados • atividade dos últimos 10 min • área local de 75 km")
 st.markdown(
     f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
     f'<div class="lightning-sub">O índice combina densidade de raios prevista pelo ECMWF, chuva/pancadas, CAPE, Lifted Index, umidade, nebulosidade e outros sinais convectivos. A atividade recente do GLM do GOES-19 entra como observação no horário atual para corrigir tempestades já em andamento.</div>'
