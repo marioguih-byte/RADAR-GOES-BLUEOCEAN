@@ -75,76 +75,70 @@ GRID_STEP = 0.5
 IDW_POWER = 4.0
 HORIZON_MAX = 6
 TZ = "America/Sao_Paulo"
-WEATHERBIT_HOURLY_URL = "https://api.weatherbit.io/v2.0/forecast/hourly"
-WEATHERBIT_CURRENT_URL = "https://api.weatherbit.io/v2.0/current"
-WEATHERBIT_LIGHTNING_URL = "https://api.weatherbit.io/v2.0/current/lightning"
+
+WEATHERAPI_FORECAST_URL = "https://api.weatherapi.com/v1/forecast.json"
+API_KEY = "5af4a42f4f40420993975651262109"
 
 
-def get_api_key():
-    key = None
-    try:
-        key = st.secrets.get("WEATHERBIT_API_KEY")
-    except Exception:
-        pass
-    return key or os.getenv("WEATHERBIT_API_KEY")
+def weatherapi_forecast(lat, lon):
+    params = {
+        "key": API_KEY,
+        "q": f"{lat:.5f},{lon:.5f}",
+        "days": 1,
+        "aqi": "no",
+        "alerts": "no",
+        "lang": "pt",
+    }
+    resp = requests.get(WEATHERAPI_FORECAST_URL, params=params, timeout=18)
+    if resp.status_code != 200:
+        try:
+            msg = resp.json().get("error", {}).get("message", resp.text[:240])
+        except Exception:
+            msg = resp.text[:240]
+        raise RuntimeError(f"HTTP {resp.status_code}: {msg}")
+    return resp.json()
 
 
-API_KEY = "340a6f07746341b29ee05a46c2ce3c65"
-# WEATHERBIT_API_KEY fica no backend e não é mostrado na interface.
-
-
-def api_error(resp):
-    try:
-        data = resp.json()
-        msg = data.get("error") or data.get("status_message") or str(data)
-    except Exception:
-        msg = resp.text[:300]
-    return f"HTTP {resp.status_code}: {msg}"
-
-
-def weatherbit_get(url, params, timeout=25):
-    p = dict(params)
-    p["key"] = API_KEY
-    r = requests.get(url, params=p, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(api_error(r))
-    return r.json(), r.headers
-
-
-def hourly_point(lat, lon):
-    data, headers = weatherbit_get(
-        WEATHERBIT_HOURLY_URL,
-        {
-            "lat": lat,
-            "lon": lon,
-            "hours": HORIZON_MAX + 1,
-            "units": "M",
-            "lang": "pt",
-        },
-    )
+def parse_weatherapi(payload, fallback_lat, fallback_lon):
     rows = []
-    for item in data.get("data", [])[:HORIZON_MAX + 1]:
-        w = item.get("weather") or {}
-        rows.append({
-            "lat": lat,
-            "lon": lon,
-            "tempo": pd.to_datetime(item.get("timestamp_local"), errors="coerce"),
-            "precipitation": float(item.get("precip", 0) or 0),
-            "pop": float(item.get("pop", 0) or 0),
-            "gust": float(item.get("wind_gust_spd", 0) or 0) * 3.6,
-            "rh": float(item.get("rh", np.nan)),
-            "clouds": float(item.get("clouds", np.nan)),
-            "weather_code": int(w.get("code", 0) or 0),
-            "weather_description": str(w.get("description", "")),
-        })
-    return pd.DataFrame(rows), headers
+    for fd in payload.get("forecast", {}).get("forecastday", []):
+        for h in fd.get("hour", []):
+            c = h.get("condition") or {}
+            rows.append({
+                "lat": float(payload.get("location", {}).get("lat", fallback_lat)),
+                "lon": float(payload.get("location", {}).get("lon", fallback_lon)),
+                "tempo": pd.to_datetime(h.get("time"), errors="coerce"),
+                "precipitation": float(h.get("precip_mm", 0) or 0),
+                "pop": float(h.get("chance_of_rain", 0) or 0),
+                "gust": float(h.get("gust_kph", 0) or 0),
+                "rh": float(h.get("humidity", np.nan)),
+                "clouds": float(h.get("cloud", np.nan)),
+                "weather_code": int(c.get("code", 0) or 0),
+                "weather_description": str(c.get("text", "")),
+                "will_it_rain": int(h.get("will_it_rain", 0) or 0),
+                "pressure": float(h.get("pressure_mb", np.nan)),
+                "temp_c": float(h.get("temp_c", np.nan)),
+                "dewpoint_c": float(h.get("dewpoint_c", np.nan)),
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    # WeatherAPI returns local time for the requested coordinate.
+    now_local = pd.Timestamp.now(tz=None).floor("h")
+    df = df[df["tempo"] >= now_local].head(HORIZON_MAX + 1).reset_index(drop=True)
+    return df
 
 
 def make_sample_points(ulat, ulon):
-    # 3x3: centro + oito vizinhos, espaçados pelo limite regional.
-    offsets = np.array([-REGION_HALFSPAN, 0.0, REGION_HALFSPAN])
-    pts = [(ulat + dy, ulon + dx) for dy in offsets for dx in offsets]
-    return pts
+    # 5 points: center + four cardinal points. The IDW fills the whole map.
+    h = REGION_HALFSPAN
+    return [
+        (ulat, ulon),
+        (ulat + h, ulon),
+        (ulat - h, ulon),
+        (ulat, ulon + h),
+        (ulat, ulon - h),
+    ]
 
 
 @st.cache_data(ttl=1800, show_spinner=False, max_entries=32)
@@ -152,19 +146,71 @@ def load_region(ulat, ulon):
     points = make_sample_points(ulat, ulon)
     frames = []
     errors = []
-    # Weatherbit Free é limitado a 1 req/s; execução sequencial evita 429.
-    for i, (lat, lon) in enumerate(points):
+
+    for lat, lon in points:
         try:
-            df, _ = hourly_point(lat, lon)
-            frames.append(df)
-            if i < len(points) - 1:
-                time.sleep(1.05)
+            data = weatherapi_forecast(lat, lon)
+            frame = parse_weatherapi(data, lat, lon)
+            if not frame.empty:
+                frames.append(frame)
         except Exception as exc:
             errors.append(f"{lat:.3f},{lon:.3f}: {exc}")
+
+        # Avoid burst limits on entry-level plans.
+        time.sleep(0.45)
+
     if not frames:
-        raise RuntimeError("Nenhum ponto Weatherbit foi retornado.\n" + "\n".join(errors))
+        raise RuntimeError(
+            "Nenhum ponto WeatherAPI foi retornado.\n" + "\n".join(errors)
+        )
     return pd.concat(frames, ignore_index=True), errors
 
+
+def lightning_heuristic(df):
+    p = np.clip(df["precipitation"].fillna(0).to_numpy(), 0, None)
+    pop = np.clip(df["pop"].fillna(0).to_numpy(), 0, 100)
+    gust = np.clip(df["gust"].fillna(0).to_numpy(), 0, None)
+    rh = np.clip(df["rh"].fillna(0).to_numpy(), 0, 100)
+    cloud = np.clip(df["clouds"].fillna(0).to_numpy(), 0, 100)
+    code = df["weather_code"].fillna(0).to_numpy()
+    rain_flag = df["will_it_rain"].fillna(0).to_numpy()
+    temp = df["temp_c"].fillna(np.nan).to_numpy()
+    dew = df["dewpoint_c"].fillna(np.nan).to_numpy()
+
+    # WeatherAPI thunderstorm-related condition codes.
+    thunder = np.isin(code, [1087, 1273, 1276, 1279, 1282]).astype(float)
+
+    rain_signal = np.clip(p / 8.0, 0, 1)
+    pop_signal = pop / 100.0
+    gust_signal = np.clip((gust - 30.0) / 45.0, 0, 1)
+    humidity_signal = np.clip((rh - 65.0) / 30.0, 0, 1)
+    cloud_signal = np.clip((cloud - 65.0) / 35.0, 0, 1)
+
+    dew_dep = np.where(np.isfinite(temp) & np.isfinite(dew), np.maximum(temp - dew, 0), 10)
+    moisture_signal = np.clip(1.0 - dew_dep / 10.0, 0, 1)
+
+    # Heuristic, not observed lightning probability.
+    score = (
+        0.48 * thunder
+        + 0.17 * rain_signal
+        + 0.12 * pop_signal
+        + 0.08 * rain_flag
+        + 0.06 * gust_signal
+        + 0.05 * humidity_signal
+        + 0.03 * cloud_signal
+        + 0.01 * moisture_signal
+    ) * 100.0
+
+    # A thunderstorm condition itself should never be shown as very low.
+    score = np.where(thunder > 0, np.maximum(score, 70.0), score)
+    score = np.clip(score, 0, 100)
+
+    classes = np.select(
+        [score < 20, score < 40, score < 60, score < 80],
+        ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
+        default="MUITO ALTO",
+    )
+    return score, classes
 
 def idw(values_lat, values_lon, values, grid_lat, grid_lon, power=IDW_POWER):
     plat = np.asarray(values_lat, float)
@@ -224,34 +270,11 @@ def lightning_heuristic(df):
     return score, classes
 
 
-@st.cache_data(ttl=300, show_spinner=False, max_entries=64)
-def current_lightning(lat, lon):
-    data, _ = weatherbit_get(
-        WEATHERBIT_LIGHTNING_URL,
-        {
-            "lat": lat,
-            "lon": lon,
-            "search_distance_km": 75,
-            "search_mins": 15,
-            "limit": 100,
-            "sort": "time",
-        },
-    )
-    return data
 
-
+# A WeatherAPI não é usada aqui para desenhar pontos de flashes.
+# O índice é exclusivamente heurístico a partir da previsão horária.
 def observed_lightning_score(lat, lon):
-    try:
-        data = current_lightning(lat, lon)
-    except Exception:
-        return None, None
-    flashes = data.get("lightning") or []
-    if not flashes:
-        return 0.0, 0
-    count = len(flashes)
-    # Saturação suave: muitos flashes próximos elevam o índice rapidamente.
-    score = 100.0 * (1.0 - math.exp(-count / 15.0))
-    return float(score), count
+    return None, None
 
 
 def map_figure(field, glat, glon, unit_name, ulat, ulon, when, title, label, vmax, cmap, lightning_mode=False):
@@ -339,7 +362,7 @@ div[data-testid="stMetric"]{background:#151922;border:1px solid #292f3a;border-r
 """, unsafe_allow_html=True)
 
 st.markdown("## ⚡ RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES")
-st.caption("WEATHERBIT • PREVISÃO HORÁRIA • 0 A +6 H • ICON/ECMWF SELECIONADOS PELA WEATHERBIT • IDW 0,5° • POTENCIAL DE RAIOS")
+st.caption("WEATHERAPI.COM • PREVISÃO HORÁRIA • 0 A +6 H • IDW 0,5° • POTENCIAL HEURÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -363,16 +386,12 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-if not API_KEY:
-    st.error("Defina WEATHERBIT_API_KEY nos Secrets do Streamlit Cloud (ou como variável de ambiente WEATHERBIT_API_KEY).")
-    st.info("A chave não é exibida na interface.")
-    st.stop()
 
-with st.spinner(f"CONSULTANDO WEATHERBIT • 9 PONTOS DA REGIÃO DE {selected.upper()}..."):
+with st.spinner(f"CONSULTANDO WEATHERAPI.COM • 5 PONTOS DA REGIÃO DE {selected.upper()}..."):
     try:
         df, errors = load_region(float(ulat), float(ulon))
     except Exception as exc:
-        st.error(f"ERRO AO CONSULTAR WEATHERBIT: {type(exc).__name__}: {exc}")
+        st.error(f"ERRO AO CONSULTAR WEATHERAPI.COM: {type(exc).__name__}: {exc}")
         st.stop()
 
 if errors:
@@ -381,7 +400,7 @@ if errors:
 times = sorted(df["tempo"].dropna().unique())
 times = times[:horizon + 1]
 if not times:
-    st.error("A Weatherbit não retornou horários válidos.")
+    st.error("A WeatherAPI não retornou horários válidos.")
     st.stop()
 
 # Índice do horário selecionado fica na sessão para os botões ◀ ▶.
@@ -413,9 +432,6 @@ P = idw(fr.lat, fr.lon, fr.precipitation, g_lat, g_lon)
 G = idw(fr.lat, fr.lon, fr.gust, g_lat, g_lon)
 R = idw(fr.lat, fr.lon, fr.raios_score, g_lat, g_lon)
 
-r9, nflash = observed_lightning_score(float(ulat), float(ulon))
-if r9 is not None and nflash is not None and st.session_state.idx_hora == 0:
-    R = np.maximum(R, r9)
 
 tabs = st.tabs(["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POTENCIAL DE RAIOS"])
 
@@ -442,8 +458,6 @@ row = fr.loc[distance.idxmin()]
 score = float(row["raios_score"])
 classe = str(row["raios_classe"])
 
-if r9 is not None and st.session_state.idx_hora == 0:
-    score = max(score, r9)
 
 if score < 20:
     badge = "🟢 MUITO BAIXO"
@@ -466,7 +480,7 @@ c4.metric("POTENCIAL DE RAIOS", f"{score:.0f}/100")
 st.markdown(
     f'<div class="wb-card"><b>⚡ POTENCIAL DE RAIOS: {badge}</b><br>'
     f'<span style="color:#aeb4bf">O indicador combina previsão horária de tempestade/precipitação, probabilidade de chuva, umidade, cobertura de nuvens e rajadas. '
-    f'Para o horário inicial, quando disponível, a atividade de raios observada pela Weatherbit nos últimos 15 minutos e em até 75 km reforça o índice.</span></div>',
+    f'O índice de raios é calculado somente a partir da previsão horária da WeatherAPI.</span></div>',
     unsafe_allow_html=True
 )
 
@@ -481,8 +495,8 @@ st.dataframe(out, use_container_width=True, hide_index=True)
 st.download_button(
     "⬇️ BAIXAR CSV DA PREVISÃO",
     out.to_csv(index=False).encode("utf-8-sig"),
-    "previsao_weatherbit.csv",
+    "previsao_weatherapi.csv",
     "text/csv"
 )
 
-st.caption("Fonte: Weatherbit. A previsão horária é fornecida pelos modelos/fontes selecionados pela Weatherbit; a documentação informa que a plataforma combina modelos globais e regionais e seleciona/ajusta os melhores insumos para cada local. A API de raios fornece observações recentes e é atualizada a cada 5 minutos nas áreas cobertas por sensores geoestacionários.")
+st.caption("Fonte: WeatherAPI.com. O potencial de raios é um índice heurístico construído a partir da previsão horária; ele não representa detecção de descargas.")
