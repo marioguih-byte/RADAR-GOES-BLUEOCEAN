@@ -145,8 +145,11 @@ def parse_openmeteo(raw, lats, lons, variable_names):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
-    """Uma única chamada ao Open-Meteo/ECMWF para toda a grade."""
+def consultar_previsao_icon(lats_tuple, lons_tuple):
+    """Consulta única ao DWD ICON Global via Open-Meteo.
+
+    Precipitação e rajadas usadas nos mapas são provenientes do ICON.
+    """
     variables = [
         "precipitation",
         "precipitation_probability",
@@ -159,7 +162,6 @@ def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
         "relative_humidity_2m",
         "cloud_cover",
         "weather_code",
-        "lightning_density",
     ]
     params = {
         "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
@@ -175,12 +177,11 @@ def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
     last = None
     for attempt in range(4):
         try:
-            r = requests.get("https://api.open-meteo.com/v1/ecmwf", params=params, timeout=75)
+            r = requests.get("https://api.open-meteo.com/v1/dwd-icon", params=params, timeout=75)
             if r.status_code == 429:
-                wait = 1.5 * (2 ** attempt)
                 import time
-                time.sleep(wait)
-                last = RuntimeError(f"HTTP 429 após tentativa {attempt + 1}")
+                time.sleep(1.5 * (2 ** attempt))
+                last = RuntimeError(f"HTTP 429 no ICON após tentativa {attempt + 1}")
                 continue
             r.raise_for_status()
             return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), variables)
@@ -193,8 +194,38 @@ def consultar_previsao_ecmwf(lats_tuple, lons_tuple):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def consultar_raios_ecmwf(lats_tuple, lons_tuple):
+    """Densidade de raios prevista pelo ECMWF para o índice holístico."""
+    params = {
+        "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
+        "longitude": ",".join(f"{x:.5f}" for x in lons_tuple),
+        "hourly": "lightning_density",
+        "forecast_hours": MAX_HOURS + 1,
+        "timezone": TZ,
+        "cell_selection": "land",
+    }
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get("https://api.open-meteo.com/v1/ecmwf", params=params, timeout=60)
+            if r.status_code == 429:
+                import time
+                time.sleep(1.5 * (2 ** attempt))
+                last = RuntimeError(f"HTTP 429 no ECMWF após tentativa {attempt + 1}")
+                continue
+            r.raise_for_status()
+            return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), ["lightning_density"])
+        except Exception as exc:
+            last = exc
+            if attempt < 2:
+                import time
+                time.sleep(1.0 * (2 ** attempt))
+    raise last
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def consultar_prob_trovoada_gfs(lats_tuple, lons_tuple):
-    """Probabilidade de trovoada do GFS em uma única chamada espacial."""
+    """Probabilidade de trovoada do GFS para complementar o índice."""
     params = {
         "latitude": ",".join(f"{x:.5f}" for x in lats_tuple),
         "longitude": ",".join(f"{x:.5f}" for x in lons_tuple),
@@ -213,8 +244,7 @@ def consultar_prob_trovoada_gfs(lats_tuple, lons_tuple):
                 last = RuntimeError(f"HTTP 429 no GFS após tentativa {attempt + 1}")
                 continue
             r.raise_for_status()
-            raw = r.json()
-            return parse_openmeteo(raw, list(lats_tuple), list(lons_tuple), ["thunderstorm_probability"])
+            return parse_openmeteo(r.json(), list(lats_tuple), list(lons_tuple), ["thunderstorm_probability"])
         except Exception as exc:
             last = exc
             if attempt < 2:
@@ -370,7 +400,7 @@ def classe_cor(classe):
     }.get(classe, "#777777")
 
 
-def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode, glm_lat=None, glm_lon=None):
+def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cmap, mode):
     fig = plt.figure(figsize=(7.7, 4.85), dpi=140, facecolor="white")
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_facecolor("white")
@@ -384,6 +414,7 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
     x0, x1 = float(lon_edges[0]), float(lon_edges[-1])
     y0, y1 = float(lat_edges[0]), float(lat_edges[-1])
     ax.set_extent([x0, x1, y0, y1], crs=ccrs.PlateCarree())
+    ax.set_aspect("auto")
 
     if mode == "raios":
         colors = ["#2E7D32", "#8BC34A", "#FDD835", "#FB8C00", "#D32F2F"]
@@ -443,11 +474,6 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
     ax.scatter([ulon], [ulat], marker="o", s=13, facecolor="black", edgecolor="white",
                linewidth=0.5, transform=ccrs.PlateCarree(), zorder=7)
 
-    if mode == "raios" and glm_lat is not None and len(glm_lat):
-        ax.scatter(glm_lon, glm_lat, marker="+", s=30, linewidths=0.8,
-                   c="#111111", alpha=0.65, transform=ccrs.PlateCarree(),
-                   zorder=8, label="GLM — últimos 10 min")
-
     ax.set_title(
         f"{unit}\n{pd.Timestamp(when):%d/%m/%Y %H:%M} LOCAL • {title}",
         fontsize=11.5, fontweight="bold", color="#171717", pad=7,
@@ -457,7 +483,7 @@ def mapa_cartopy(GLA, GLO, field, unit, ulat, ulon, when, title, label, vmax, cm
         ax.spines["geo"].set_linewidth(0.8)
     except Exception:
         pass
-    fig.subplots_adjust(left=0.055, right=0.91, bottom=0.075, top=0.86)
+    fig.subplots_adjust(left=0.035, right=0.915, bottom=0.055, top=0.875)
     return fig
 
 
@@ -484,7 +510,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO ECMWF + GFS • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO ICON + ECMWF + GFS • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -502,7 +528,7 @@ with st.sidebar:
     st.markdown(f"**POTÊNCIA IDW:** FIXA EM {IDW_POWER:.1f}")
     st.caption("A extensão, a potência e a resolução são fixas para manter a consulta rápida e a comparação espacial consistente.")
     if st.button("🔄 ATUALIZAR AGORA", use_container_width=True):
-        consultar_previsao_ecmwf.clear()
+        consultar_previsao_icon.clear()
         consultar_prob_trovoada_gfs.clear()
         consultar_glm_10min.clear()
         st.session_state.time_index = 0
@@ -512,9 +538,22 @@ GLA, GLO = make_grid(ulat, ulon)
 lats = tuple(GLA.ravel().tolist())
 lons = tuple(GLO.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS..."):
+with st.spinner(f"CONSULTANDO OPEN-METEO ICON + ECMWF + GFS + GLM — {len(lats)} PONTOS..."):
     try:
-        df = consultar_previsao_ecmwf(lats, lons)
+        # ICON é a fonte principal para precipitação e rajadas.
+        df = consultar_previsao_icon(lats, lons)
+
+        # ECMWF: densidade prevista de raios.
+        try:
+            df_ecmwf = consultar_raios_ecmwf(lats, lons)
+            df = df.merge(
+                df_ecmwf[["lat", "lon", "tempo", "lightning_density"]],
+                on=["lat", "lon", "tempo"], how="left"
+            )
+        except Exception:
+            df["lightning_density"] = np.nan
+
+        # GFS: probabilidade de trovoada.
         try:
             df_gfs = consultar_prob_trovoada_gfs(lats, lons)
             df = df.merge(
@@ -523,6 +562,8 @@ with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS...")
             )
         except Exception:
             df["thunderstorm_probability"] = np.nan
+
+        # GLM apenas como observação do estado atual. Os flashes não são desenhados.
         glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
         glm_lat, glm_lon = np.array([]), np.array([])
         try:
@@ -534,8 +575,7 @@ with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS...")
         df["glm_flashes_10min"] = 0.0
         df["glm_score"] = 0.0
 
-        # Campo espacial de GLM: conta flashes nos mesmos pixels de 0,5°
-        # usados no mapa, sem suavização. O valor é observado nos últimos 10 min.
+        # O GLM entra no índice, mas não é plotado como pontos.
         if glm_lat.size:
             lat_centers = np.unique(GLA[:, 0])
             lon_centers = np.unique(GLO[0, :])
@@ -543,28 +583,30 @@ with st.spinner(f"CONSULTANDO OPEN-METEO/ECMWF E GLM — {len(lats)} PONTOS...")
             bj = np.clip(np.rint((glm_lon - lon_centers[0]) / GRID_STEP).astype(int), 0, len(lon_centers)-1)
             key_counts = {}
             for ii, jj in zip(bi, bj):
-                key_counts[(float(lat_centers[ii]), float(lon_centers[jj]))] = key_counts.get((float(lat_centers[ii]), float(lon_centers[jj])), 0) + 1
+                key = (float(lat_centers[ii]), float(lon_centers[jj]))
+                key_counts[key] = key_counts.get(key, 0) + 1
             base_mask = df["tempo"] == base_t
             for (la0, lo0), cnt in key_counts.items():
-                m = base_mask & (np.isclose(df["lat"], la0)) & (np.isclose(df["lon"], lo0))
-                if m.any():
-                    df.loc[m, "glm_flashes_10min"] = float(cnt)
-                    df.loc[m, "glm_score"] = float(100.0 * (1.0 - np.exp(-cnt / 3.0)))
+                msk = base_mask & np.isclose(df["lat"], la0) & np.isclose(df["lon"], lo0)
+                if msk.any():
+                    df.loc[msk, "glm_flashes_10min"] = float(cnt)
+                    df.loc[msk, "glm_score"] = float(100.0 * (1.0 - np.exp(-cnt / 3.0)))
+        else:
+            base_mask = df["tempo"] == base_t
 
-        # Persiste o padrão espacial observado com decaimento para o nowcast
-        # enquanto o modelo numérico passa a dominar gradualmente.
         base_map = {(float(r.lat), float(r.lon)): float(r.glm_score) for r in df[base_mask].itertuples()}
         base_count = {(float(r.lat), float(r.lon)): float(r.glm_flashes_10min) for r in df[base_mask].itertuples()}
         for idx, row in df.iterrows():
             key = (float(row["lat"]), float(row["lon"]))
             if row["tempo"] != base_t:
                 lead = (pd.Timestamp(row["tempo"]) - base_t).total_seconds()/3600.0
-                df.at[idx, "glm_score"] = base_map.get(key, 0.0)
-                df.at[idx, "glm_flashes_10min"] = base_count.get(key, 0.0) * np.exp(-max(lead,0)/1.1)
+                decay = np.exp(-max(lead, 0)/1.1)
+                df.at[idx, "glm_score"] = base_map.get(key, 0.0) * decay
+                df.at[idx, "glm_flashes_10min"] = base_count.get(key, 0.0) * decay
 
         df = calcular_indice_holistico(df)
     except Exception as exc:
-        st.error(f"ERRO AO CONSULTAR OPEN-METEO/GLM: {type(exc).__name__}: {exc}")
+        st.error(f"ERRO AO CONSULTAR OPEN-METEO ICON/ECMWF/GFS/GLM: {type(exc).__name__}: {exc}")
         st.stop()
 
 # Tempos horários 0h ... +6h.
@@ -608,13 +650,13 @@ T1, T2, T3 = st.tabs(["🌧️ PRECIPITAÇÃO", "💨 RAJADA DE VENTO", "⚡ POT
 
 with T1:
     field = idw_grid(fr.lat, fr.lon, fr["precipitation"], PGLA, PGLO)
-    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "PRECIPITAÇÃO", "PRECIPITAÇÃO (MM/H)", vmax_p, "turbo", "normal")
+    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "PRECIPITAÇÃO • ICON", "PRECIPITAÇÃO (MM/H)", vmax_p, "turbo", "normal")
     st.pyplot(fig, use_container_width=False)
     plt.close(fig)
 
 with T2:
     field = idw_grid(fr.lat, fr.lon, fr["wind_gusts_10m"], PGLA, PGLO)
-    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "RAJADA DE VENTO", "RAJADA (KM/H)", vmax_g, "magma", "normal")
+    fig = mapa_cartopy(PGLA, PGLO, field, unidade_nome, ulat, ulon, when, "RAJADA DE VENTO • ICON", "RAJADA (KM/H)", vmax_g, "magma", "normal")
     st.pyplot(fig, use_container_width=False)
     plt.close(fig)
 
@@ -622,9 +664,7 @@ with T3:
     field = idw_grid(fr.lat, fr.lon, fr["raios_score"], PGLA, PGLO)
     fig = mapa_cartopy(
         PGLA, PGLO, field, unidade_nome, ulat, ulon, when,
-        "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios",
-        glm_lat=glm_lat if when == base_t else None,
-        glm_lon=glm_lon if when == base_t else None
+        "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios"
     )
     st.pyplot(fig, use_container_width=False)
     plt.close(fig)
@@ -678,4 +718,4 @@ tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", 
 st.dataframe(tabela, use_container_width=True, hide_index=True)
 st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-st.caption("Fonte de previsão: Open-Meteo/ECMWF. Observação recente de descargas: GLM/GOES-19. O indicador holístico combina previsão e observação recente; não é uma probabilidade estatística calibrada de raios.")
+st.caption("PRECIPITAÇÃO E RAJADAS: OPEN-METEO/DWD ICON. RAIOS: ICON + ECMWF + GFS + GLM RECENTE. O ÍNDICE É HEURÍSTICO E NÃO REPRESENTA UMA PROBABILIDADE ESTATÍSTICA CALIBRADA.")
