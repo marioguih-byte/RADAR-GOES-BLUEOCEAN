@@ -1,32 +1,32 @@
 # RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
-Dashboard Streamlit usando exclusivamente a API Open-Meteo.
+Dashboard Streamlit baseado na versão estável do aplicativo, mantendo a estrutura do Open-Meteo/DWD ICON e acrescentando observação real do GLM do GOES-19 para raios.
 
 ## Recursos
-- Precipitação horária.
+- Precipitação horária do DWD ICON via Open-Meteo.
 - Rajada de vento a 10 m.
 - Potencial holístico de raios.
 - Horizonte de 0 a +6 horas.
-- Grade de consulta Open-Meteo fixa em 0,5°.
+- Grade espacial fixa de 0,5°.
 - Potência IDW fixa em 4,0.
 - Campo espacial pixelado com `pcolormesh` sem linhas entre as células.
 - Cartopy para costa, fronteiras e estados.
-- Setas para navegar entre as horas.
+- Navegação entre as horas.
 - 40 unidades em ordem alfabética.
 - Download CSV da previsão horária.
 
-## Potencial holístico de raios
-O índice combina a probabilidade de trovoada do Open-Meteo com a densidade de raios modelada pelo ECMWF disponibilizada pelo Open-Meteo, além de precipitação convectiva, CAPE, Lifted Index, probabilidade de precipitação, umidade e cobertura de nuvens.
+## GLM do GOES-19
+A aplicação consulta os arquivos públicos NOAA GOES-19 GLM-L2-LCFA no bucket `noaa-goes19`, lê os centroides geográficos dos flashes (`flash_lat` e `flash_lon`) e restringe a leitura à região da unidade selecionada.
 
-Ele é um indicador de potencial previsto, não uma observação/detecção de descargas em tempo real.
+O horário corrente utiliza a observação real recente do GLM. Para as horas seguintes, os flashes observados alimentam um nowcast espacial simples por deslocamento do centro de atividade e decaimento temporal, combinado com o potencial previsto pelo ICON.
+
+Os flashes individuais não são desenhados como pontos no mapa. O GLM é convertido em um campo espacial e visualizado na mesma grade de 0,5° do aplicativo.
+
+## Observação importante
+O GLM é uma observação, não uma previsão. O nowcast futuro é uma extrapolação de curto prazo baseada na atividade observada recentemente; ele não deve ser interpretado como previsão estatística calibrada de raios.
 
 ## Executar
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-
-## Raios
-
-A versão atual combina previsão do Open-Meteo (GFS/ECMWF) com observação recente do GLM do GOES-19. O GLM-L2-LCFA fornece flashes individuais com centroides geográficos; a aplicação conta os flashes dos últimos 10 minutos em um raio de 75 km da unidade e usa essa observação para corrigir o horário corrente e alimentar um decaimento de curto prazo.

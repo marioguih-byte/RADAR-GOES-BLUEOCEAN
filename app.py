@@ -1,6 +1,9 @@
+import io
 import re
 import unicodedata
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import numpy as np
@@ -21,6 +24,12 @@ MAX_HOURS = 6
 TZ = "America/Sao_Paulo"
 REGION_HALFSPAN = 2.5
 GLM_WINDOW_MIN = 10
+GLM_RECENT_MIN = 6
+GLM_PREVIOUS_MIN = 6
+GLM_BUCKET = "noaa-goes19"
+GLM_BASE_URL = f"https://{GLM_BUCKET}.s3.amazonaws.com"
+GLM_CACHE_TTL = 90
+GLM_UNIT_RADIUS_KM = 75.0
 
 st.set_page_config(page_title=SITE_TITLE, page_icon="⚡", layout="wide")
 
@@ -250,6 +259,231 @@ def consultar_prob_trovoada_gfs(lats_tuple, lons_tuple):
     raise last
 
 
+
+def _parse_glm_timestamp(key: str):
+    m = re.search(r"_s(\d{13})", key)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _listar_glm_hora(when_utc: datetime):
+    when_utc = when_utc.astimezone(timezone.utc)
+    prefix = f"GLM-L2-LCFA/{when_utc:%Y}/{when_utc:%j}/{when_utc:%H}/"
+    params = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
+    r = requests.get(GLM_BASE_URL + "/", params=params, timeout=20)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    keys = []
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == "Key" and elem.text:
+            keys.append(elem.text)
+    return keys
+
+
+def _achar_dataset_h5(grupo, nome):
+    alvo = nome.lower()
+    for key in grupo.keys():
+        obj = grupo[key]
+        if hasattr(obj, "keys"):
+            found = _achar_dataset_h5(obj, nome)
+            if found is not None:
+                return found
+        elif getattr(obj, "name", "").rsplit("/", 1)[-1].lower() == alvo:
+            return obj
+    return None
+
+
+def _ler_glm_arquivo(key: str, bbox):
+    import h5py
+
+    url = f"{GLM_BASE_URL}/{key}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    with h5py.File(io.BytesIO(r.content), "r") as h5:
+        lat_ds = _achar_dataset_h5(h5, "flash_lat")
+        lon_ds = _achar_dataset_h5(h5, "flash_lon")
+        energy_ds = _achar_dataset_h5(h5, "flash_energy")
+        if lat_ds is None or lon_ds is None:
+            return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+        lat = np.asarray(lat_ds[...], dtype=float).ravel()
+        lon = np.asarray(lon_ds[...], dtype=float).ravel()
+        if energy_ds is None:
+            energy = np.zeros_like(lat)
+        else:
+            energy = np.asarray(energy_ds[...], dtype=float).ravel()
+
+    if lon.size:
+        lon = np.where(lon > 180.0, lon - 360.0, lon)
+    tfile = _parse_glm_timestamp(key)
+    if tfile is None:
+        return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+
+    lon0, lon1, lat0, lat1 = bbox
+    n = min(lat.size, lon.size, energy.size)
+    if n == 0:
+        return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+    lat, lon, energy = lat[:n], lon[:n], energy[:n]
+    good = (
+        np.isfinite(lat) & np.isfinite(lon) & np.isfinite(energy)
+        & (lat >= lat0) & (lat <= lat1)
+        & (lon >= lon0) & (lon <= lon1)
+    )
+    if not good.any():
+        return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+    return pd.DataFrame({
+        "lat": lat[good],
+        "lon": lon[good],
+        "energia": np.maximum(energy[good], 0.0),
+        "tempo": pd.Timestamp(tfile),
+    })
+
+
+@st.cache_data(ttl=GLM_CACHE_TTL, show_spinner=False)
+def fetch_glm_recent(ulat: float, ulon: float, lookback_min: int = GLM_RECENT_MIN + GLM_PREVIOUS_MIN):
+    """Busca flashes reais do GOES-19 GLM-L2-LCFA no AWS S3 público do NOAA.
+
+    O filtro espacial é aplicado depois da leitura dos arquivos para manter a
+    consulta limitada à região da unidade selecionada. Cada arquivo GLM-L2-LCFA
+    representa um período de aproximadamente 20 s de detecções de relâmpagos.
+    """
+    agora = datetime.now(timezone.utc)
+    inicio = agora - timedelta(minutes=int(lookback_min))
+    bbox = (
+        ulon - REGION_HALFSPAN - 0.75,
+        ulon + REGION_HALFSPAN + 0.75,
+        ulat - REGION_HALFSPAN - 0.75,
+        ulat + REGION_HALFSPAN + 0.75,
+    )
+
+    horas = {inicio.replace(minute=0, second=0, microsecond=0),
+             agora.replace(minute=0, second=0, microsecond=0)}
+    keys = []
+    falhas = []
+    for h in sorted(horas):
+        try:
+            keys.extend(_listar_glm_hora(h))
+        except Exception as exc:
+            falhas.append(f"listagem {h:%H:%M}Z: {type(exc).__name__}: {exc}")
+
+    selecionados = []
+    vistos = set()
+    for key in keys:
+        if key in vistos:
+            continue
+        vistos.add(key)
+        t = _parse_glm_timestamp(key)
+        if t is not None and inicio <= t <= agora:
+            selecionados.append((t, key))
+    selecionados.sort(key=lambda x: x[0])
+
+    if not selecionados:
+        return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+
+    frames = []
+    max_workers = min(8, max(2, len(selecionados)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = {pool.submit(_ler_glm_arquivo, key, bbox): (t, key) for t, key in selecionados}
+        for fut in as_completed(futs):
+            t, key = futs[fut]
+            try:
+                frame = fut.result()
+                if not frame.empty:
+                    frames.append(frame)
+            except Exception as exc:
+                falhas.append(f"{t:%H:%M:%S}Z: {type(exc).__name__}: {exc}")
+
+    if not frames:
+        return pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
+    return pd.concat(frames, ignore_index=True).sort_values("tempo").reset_index(drop=True)
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    lat1 = np.deg2rad(np.asarray(lat1, dtype=float))
+    lon1 = np.deg2rad(np.asarray(lon1, dtype=float))
+    lat2 = np.deg2rad(float(lat2))
+    lon2 = np.deg2rad(float(lon2))
+    dlat = lat1 - lat2
+    dlon = lon1 - lon2
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+def _glm_score_from_count(count: int) -> float:
+    if count <= 0:
+        return 0.0
+    return float(np.clip(100.0 * (1.0 - np.exp(-count / 3.0)), 0, 100))
+
+
+def _glm_motion(recent: pd.DataFrame, previous: pd.DataFrame):
+    if recent.empty or previous.empty:
+        return 0.0, 0.0
+    t1 = recent["tempo"].max()
+    t0 = previous["tempo"].max()
+    dt_hours = max((t1 - t0).total_seconds() / 3600.0, 1.0 / 60.0)
+    dlat = float(recent["lat"].mean() - previous["lat"].mean())
+    dlon = float(recent["lon"].mean() - previous["lon"].mean())
+    return float(np.clip(dlat / dt_hours, -3.0, 3.0)), float(np.clip(dlon / dt_hours, -3.0, 3.0))
+
+
+def _glm_split_windows(glm_df: pd.DataFrame):
+    if glm_df is None or glm_df.empty:
+        return (pd.DataFrame(columns=["lat", "lon", "energia", "tempo"]),
+                pd.DataFrame(columns=["lat", "lon", "energia", "tempo"]))
+    tmax = glm_df["tempo"].max()
+    recent_start = tmax - pd.Timedelta(minutes=GLM_RECENT_MIN)
+    previous_start = recent_start - pd.Timedelta(minutes=GLM_PREVIOUS_MIN)
+    recent = glm_df[glm_df["tempo"] >= recent_start].copy()
+    previous = glm_df[(glm_df["tempo"] >= previous_start) & (glm_df["tempo"] < recent_start)].copy()
+    return recent, previous
+
+
+def _glm_field_from_points(points: pd.DataFrame, glat, glon, scale=1.0):
+    if points is None or points.empty:
+        return np.zeros_like(glat, dtype=float)
+    values = np.full(len(points), 100.0 * float(scale), dtype=float)
+    field = idw_grid(points["lat"].to_numpy(), points["lon"].to_numpy(), values, glat, glon, power=IDW_POWER, k=min(24, len(values)))
+    return np.nan_to_num(np.clip(field, 0, 100), nan=0.0)
+
+
+def glm_field_nowcast(glm_df: pd.DataFrame, glat, glon, hours_ahead: int):
+    """Campo espacial do GLM observado e seu nowcast de deslocamento curto."""
+    recent, previous = _glm_split_windows(glm_df)
+    if recent.empty:
+        return np.zeros_like(glat, dtype=float)
+    vlat, vlon = _glm_motion(recent, previous)
+    future = recent.copy()
+    if hours_ahead:
+        future["lat"] = future["lat"] + vlat * float(hours_ahead)
+        future["lon"] = future["lon"] + vlon * float(hours_ahead)
+    # Janela de 0–6 h: o peso cai progressivamente, mas a posição observada
+    # continua sendo a base do nowcast de curto prazo.
+    decay = float(np.exp(-float(hours_ahead) / 2.5))
+    return _glm_field_from_points(future, glat, glon, decay)
+
+
+def glm_unit_score(glm_df: pd.DataFrame, ulat: float, ulon: float, hours_ahead: int = 0):
+    if glm_df is None or glm_df.empty:
+        return 0.0, 0, None
+    recent, previous = _glm_split_windows(glm_df)
+    if recent.empty:
+        return 0.0, 0, None
+    vlat, vlon = _glm_motion(recent, previous)
+    moved = recent.copy()
+    if hours_ahead:
+        moved["lat"] = moved["lat"] + vlat * float(hours_ahead)
+        moved["lon"] = moved["lon"] + vlon * float(hours_ahead)
+    dist = _haversine_km(moved["lat"], moved["lon"], ulat, ulon)
+    n = int(np.sum(dist <= GLM_UNIT_RADIUS_KM))
+    score = _glm_score_from_count(n)
+    if hours_ahead:
+        score *= float(np.exp(-float(hours_ahead) / 2.5))
+    return float(np.clip(score, 0, 100)), n, recent["tempo"].max()
+
+
 def calcular_indice_holistico(df):
     """Índice heurístico 0–100 usando exclusivamente variáveis do ICON.
 
@@ -437,7 +671,7 @@ st.markdown(
 )
 
 st.title(f"⚡ {SITE_TITLE}")
-st.caption("OPEN-METEO DWD ICON • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
+st.caption("OPEN-METEO DWD ICON + GOES-19 GLM • PREVISÃO HORÁRIA • 0 A +6 H • GRADE 0,5° • IDW FIXO • POTENCIAL HOLÍSTICO DE RAIOS")
 
 with st.sidebar:
     st.header("CONFIGURAÇÃO")
@@ -479,6 +713,12 @@ times = sorted(df["tempo"].drop_duplicates())[:horas + 1]
 if not times:
     st.error("A API não retornou horários para a região.")
     st.stop()
+
+with st.spinner("CONSULTANDO GOES-19 GLM REAL — ÚLTIMOS 12 MINUTOS..."):
+    try:
+        glm_df = fetch_glm_recent(ulat, ulon, GLM_RECENT_MIN + GLM_PREVIOUS_MIN)
+    except Exception:
+        glm_df = pd.DataFrame(columns=["lat", "lon", "energia", "tempo"])
 
 if "time_index" not in st.session_state or st.session_state.time_index >= len(times):
     st.session_state.time_index = 0
@@ -526,20 +766,46 @@ with T2:
     plt.close(fig)
 
 with T3:
-    field = idw_grid(fr.lat, fr.lon, fr["raios_score"], PGLA, PGLO)
+    icon_field = idw_grid(fr.lat, fr.lon, fr["raios_score"], PGLA, PGLO)
+    glm_field = glm_field_nowcast(glm_df, PGLA, PGLO, st.session_state.time_index) if not glm_df.empty else np.zeros_like(icon_field)
+    if not glm_df.empty and st.session_state.time_index == 0:
+        field = np.maximum(icon_field, 0.95 * glm_field)
+    elif not glm_df.empty:
+        h = st.session_state.time_index
+        w_glm = float(0.65 * np.exp(-h / 3.0))
+        field = np.clip((1.0 - w_glm) * icon_field + w_glm * glm_field, 0, 100)
+    else:
+        field = icon_field
     fig = mapa_cartopy(
         PGLA, PGLO, field, unidade_nome, ulat, ulon, when,
-        "POTENCIAL HOLÍSTICO DE RAIOS", "", 100, "YlOrRd", "raios"
+        "POTENCIAL HOLÍSTICO DE RAIOS • ICON + GOES-19 GLM", "", 100, "YlOrRd", "raios"
     )
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
+    if glm_df.empty:
+        st.caption("GOES-19 GLM: nenhuma observação recente disponível; o mapa utiliza o potencial previsto pelo ICON.")
+    else:
+        glm_recent_count = int(len(_glm_split_windows(glm_df)[0]))
+        glm_last = glm_df["tempo"].max()
+        age_min = max(0.0, (datetime.now(timezone.utc) - glm_last.to_pydatetime().astimezone(timezone.utc)).total_seconds() / 60.0)
+        st.caption(f"GOES-19 GLM real: {glm_recent_count} flashes na janela recente • última observação {glm_last:%d/%m %H:%M:%S}Z • atraso {age_min:.1f} min. Sem pontos individuais no mapa.")
 
 # Valor na unidade e contexto ao redor.
 nearest_i = ((fr["lat"] - ulat).abs() + (fr["lon"] - ulon).abs()).idxmin()
 unit_row = fr.loc[nearest_i]
 neighbor = fr[(fr["lat"].sub(ulat).abs() <= 1.0) & (fr["lon"].sub(ulon).abs() <= 1.0)]
 local_context = float(np.nanpercentile(neighbor["raios_score"], 80)) if np.isfinite(neighbor["raios_score"]).any() else float(unit_row["raios_score"])
-unit_score = 0.75 * float(unit_row["raios_score"]) + 0.25 * local_context
+icon_unit_score = float(np.clip(0.75 * float(unit_row["raios_score"]) + 0.25 * local_context, 0, 100))
+glm_now_score, glm_now_count, _ = glm_unit_score(glm_df, ulat, ulon, 0)
+if st.session_state.time_index == 0 and glm_now_count > 0:
+    unit_score = max(icon_unit_score, glm_now_score)
+elif not glm_df.empty:
+    h = st.session_state.time_index
+    glm_future_score, _, _ = glm_unit_score(glm_df, ulat, ulon, h)
+    w_glm = float(0.65 * np.exp(-h / 3.0))
+    unit_score = (1.0 - w_glm) * icon_unit_score + w_glm * glm_future_score
+else:
+    unit_score = icon_unit_score
 unit_score = float(np.clip(unit_score, 0, 100))
 unit_class = str(np.select([unit_score < 20, unit_score < 40, unit_score < 60, unit_score < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO"))
 
@@ -555,7 +821,7 @@ c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
 color = classe_cor(unit_class)
 st.markdown(
     f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
-    f'<div class="lightning-sub">O índice usa somente o ICON: código de tempo com trovoada, precipitação e pancadas, CAPE, Lifted Index, inibição convectiva, probabilidade de chuva, umidade, nebulosidade e rajadas.</div>'
+    f'<div class="lightning-sub">A base prevista usa o ICON. No horário corrente, o resultado incorpora flashes reais observados pelo GLM do GOES-19; nas horas seguintes, a observação recente alimenta um nowcast espacial com deslocamento e decaimento de curto prazo.</div>'
     f'<div class="legend-row">'
     f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
     f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
@@ -575,10 +841,23 @@ serie["TEMPO"] = pd.to_datetime(serie["tempo"]).dt.strftime("%d/%m %H:%M")
 serie["HORIZONTE"] = [f"{i:+d} H" for i in range(len(serie))]
 serie["PRECIPITAÇÃO (MM/H)"] = serie["precipitation"].round(1)
 serie["RAJADA (KM/H)"] = serie["wind_gusts_10m"].round(0)
-serie["RAIOS (0–100)"] = serie["raios_score"].round(0)
-serie["CLASSE"] = serie["raios_classe"]
+raios_tabela = []
+for h, (_, row) in enumerate(serie.iterrows()):
+    icon_score = float(row["raios_score"])
+    if not glm_df.empty and h == 0:
+        gs, gc, _ = glm_unit_score(glm_df, ulat, ulon, 0)
+        score = max(icon_score, gs) if gc > 0 else icon_score
+    elif not glm_df.empty:
+        gs, _, _ = glm_unit_score(glm_df, ulat, ulon, h)
+        w = float(0.65 * np.exp(-h / 3.0))
+        score = (1.0 - w) * icon_score + w * gs
+    else:
+        score = icon_score
+    raios_tabela.append(float(np.clip(score, 0, 100)))
+serie["RAIOS (0–100)"] = np.round(raios_tabela, 0)
+serie["CLASSE"] = np.select([serie["RAIOS (0–100)"] < 20, serie["RAIOS (0–100)"] < 40, serie["RAIOS (0–100)"] < 60, serie["RAIOS (0–100)"] < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO")
 tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", "RAIOS (0–100)", "CLASSE"]]
 st.dataframe(tabela, use_container_width=True, hide_index=True)
 st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-st.caption("PRECIPITAÇÃO, RAJADAS E ÍNDICE DE RAIOS: OPEN-METEO / DWD ICON. O ÍNDICE DE RAIOS É HEURÍSTICO E NÃO REPRESENTA UMA PROBABILIDADE ESTATÍSTICA CALIBRADA.")
+st.caption("PRECIPITAÇÃO E RAJADAS: OPEN-METEO / DWD ICON. RAIOS: potencial previsto do ICON combinado com observação real recente do GOES-19 GLM e nowcast de curto prazo. O índice não representa uma probabilidade estatística calibrada.")
