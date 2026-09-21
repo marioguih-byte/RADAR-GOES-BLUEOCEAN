@@ -1,25 +1,19 @@
 # RIO ULTRA POWER ULTIMATE ARNOLD SCHWARZENEGGER EDITION PREVISÕES
 
-Versão Weatherbit.
-
-## O que precisa
-Crie uma conta Weatherbit e obtenha uma API key.
-No Streamlit Cloud, coloque:
-
-WEATHERBIT_API_KEY = "SUA_CHAVE"
-
-em **Manage app → Settings → Secrets**.
+Aplicação Streamlit usando WeatherAPI.com para previsão horária.
 
 ## Recursos
 - 40 unidades em ordem alfabética.
-- Região fixa em ±2,5°.
-- Grade visual fixa em 0,5°.
-- IDW fixo, potência 4.
-- Precipitação, rajada e potencial de raios.
-- Previsão horária de 0 a +6 h.
-- Navegação por botões de hora.
-- Weatherbit Current Lightning, quando disponível no plano.
-- Download CSV.
+- Região fixa de ±2,5°.
+- Grade visual de 0,5°.
+- IDW fixo em potência 4.
+- Precipitação e rajadas horárias.
+- Índice heurístico de potencial de raios.
+- Horizonte de 0 a +6 h.
+- Navegação horária.
+- Cache de 30 minutos.
 
-## Limitação importante
-A API Hourly é por ponto. Esta implementação consulta 9 pontos da região e faz IDW. No plano gratuito da Weatherbit, a documentação informa 50 requests/dia e 1 request/s; por isso a aplicação usa consultas sequenciais com pequena espera e cache. A Current Lightning API consome quota adicional e pode depender do plano.
+## API
+A chave WeatherAPI informada pelo usuário está configurada no backend do `app.py` e não é exibida na interface.
+
+A WeatherAPI fornece previsão horária no endpoint `/forecast.json`; `q` aceita latitude/longitude e `days=1` é suficiente para o horizonte de até 6 horas. A opção de bulk é restrita a planos Pro+, por isso esta versão usa cinco pontos regionais e cache para reduzir o número de chamadas.
