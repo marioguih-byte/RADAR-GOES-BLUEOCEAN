@@ -25,3 +25,8 @@ Ele é um indicador de potencial previsto, não uma observação/detecção de d
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+
+## Raios
+
+A versão atual combina previsão do Open-Meteo (GFS/ECMWF) com observação recente do GLM do GOES-19. O GLM-L2-LCFA fornece flashes individuais com centroides geográficos; a aplicação conta os flashes dos últimos 10 minutos em um raio de 75 km da unidade e usa essa observação para corrigir o horário corrente e alimentar um decaimento de curto prazo.

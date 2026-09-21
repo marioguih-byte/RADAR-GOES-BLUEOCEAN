@@ -1,9 +1,13 @@
+import io
+import re
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 import requests
+import h5py
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -156,7 +160,6 @@ def consultar_previsao(lats_tuple, lons_tuple):
         "relative_humidity_2m",
         "cloud_cover",
         "weather_code",
-        "thunderstorm_probability",
     ]
 
     frames = []
@@ -208,6 +211,137 @@ def consultar_raios_ecmwf(lats_tuple, lons_tuple):
     return pd.concat(frames, ignore_index=True)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def consultar_trovoada_gfs(lats_tuple, lons_tuple):
+    lats = list(lats_tuple)
+    lons = list(lons_tuple)
+    frames = []
+    for la, lo in zip(batches(lats, 40), batches(lons, 40)):
+        params = {
+            "latitude": ",".join(f"{x:.5f}" for x in la),
+            "longitude": ",".join(f"{x:.5f}" for x in lo),
+            "hourly": "thunderstorm_probability",
+            "forecast_hours": MAX_HOURS + 1,
+            "timezone": TZ,
+            "cell_selection": "land",
+        }
+        r = requests.get("https://api.open-meteo.com/v1/gfs", params=params, timeout=60)
+        r.raise_for_status()
+        frames.append(parse_openmeteo(r.json(), la, lo, ["thunderstorm_probability"]))
+    return pd.concat(frames, ignore_index=True)
+
+
+def _parse_s3_key_time(key):
+    m = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})(\d{2})", key)
+    if not m:
+        return None
+    year, doy, hh, mm, ss = map(int, m.groups())
+    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=doy-1, hours=hh, minutes=mm, seconds=ss)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def consultar_glm_10min(lats_tuple, lons_tuple, unit_lat, unit_lon):
+    """Busca os últimos 10 min de GLM-L2-LCFA do GOES-19 e conta flashes.
+
+    O produto GLM-L2-LCFA contém flashes individuais, com latitude/longitude
+    do centroide. Cada arquivo cobre um período de 20 s. O cálculo abaixo usa
+    um raio de 75 km para produzir uma medida local de atividade recente.
+    """
+    now = datetime.now(timezone.utc)
+    prefixes = []
+    for h in [now.replace(minute=0, second=0, microsecond=0),
+              (now - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)]:
+        prefixes.append(f"GLM-L2-LCFA/{h:%Y}/{h.timetuple().tm_yday:03d}/{h:%H}/")
+
+    keys = []
+    for prefix in prefixes:
+        try:
+            r = requests.get(
+                "https://noaa-goes19.s3.amazonaws.com/",
+                params={"list-type": "2", "prefix": prefix, "max-keys": 1000},
+                timeout=30,
+            )
+            r.raise_for_status()
+            keys.extend(re.findall(r"<Key>([^<]*GLM-L2-LCFA[^<]*)</Key>", r.text))
+        except Exception:
+            continue
+
+    cutoff = now - timedelta(minutes=10)
+    selected = []
+    for key in keys:
+        t = _parse_s3_key_time(key)
+        if t is not None and cutoff <= t <= now + timedelta(seconds=30):
+            selected.append((t, key))
+    selected = sorted({k: (t, k) for t, k in selected}.values())
+
+    if not selected:
+        empty = pd.DataFrame({
+            "lat": list(lats_tuple), "lon": list(lons_tuple),
+            "glm_flashes_10min": 0.0, "glm_score": 0.0,
+        })
+        return empty, 0, 0, "SEM DADOS GLM"
+
+    flashes_lat = []
+    flashes_lon = []
+    success = 0
+    for _, key in selected[-36:]:
+        try:
+            rr = requests.get(f"https://noaa-goes19.s3.amazonaws.com/{key}", timeout=45)
+            rr.raise_for_status()
+            with h5py.File(io.BytesIO(rr.content), "r") as ds:
+                if "flash_lat" not in ds or "flash_lon" not in ds:
+                    continue
+                la = np.asarray(ds["flash_lat"][:], dtype=float)
+                lo = np.asarray(ds["flash_lon"][:], dtype=float)
+            good = np.isfinite(la) & np.isfinite(lo)
+            if good.any():
+                flashes_lat.append(la[good])
+                flashes_lon.append(lo[good])
+            success += 1
+        except Exception:
+            continue
+
+    if not flashes_lat:
+        empty = pd.DataFrame({
+            "lat": list(lats_tuple), "lon": list(lons_tuple),
+            "glm_flashes_10min": 0.0, "glm_score": 0.0,
+        })
+        return empty, 0, success, "GLM SEM FLASHES"
+
+    fla = np.concatenate(flashes_lat)
+    flo = np.concatenate(flashes_lon)
+
+    # Filtra geograficamente para manter o cálculo leve.
+    glat_arr = np.asarray(lats_tuple, float)
+    glon_arr = np.asarray(lons_tuple, float)
+    keep = (
+        (fla >= glat_arr.min() - 1.5) & (fla <= glat_arr.max() + 1.5) &
+        (flo >= glon_arr.min() - 1.5) & (flo <= glon_arr.max() + 1.5)
+    )
+    fla, flo = fla[keep], flo[keep]
+
+    def count_around(qla, qlo, radius_km=75.0):
+        if fla.size == 0:
+            return 0
+        lat0 = np.deg2rad(float(qla))
+        dx = (flo - float(qlo)) * 111.32 * np.cos(lat0)
+        dy = (fla - float(qla)) * 111.32
+        return int(np.count_nonzero(dx*dx + dy*dy <= radius_km*radius_km))
+
+    counts = np.array([count_around(a, o) for a, o in zip(glat_arr, glon_arr)], dtype=float)
+    # Escala saturante: 10 flashes/10min = ~57, 20 = ~81, 30 = ~92.
+    scores = 100.0 * (1.0 - np.exp(-counts / 12.0))
+    unit_count = count_around(unit_lat, unit_lon)
+    unit_score = 100.0 * (1.0 - np.exp(-unit_count / 12.0))
+
+    result = pd.DataFrame({
+        "lat": glat_arr, "lon": glon_arr,
+        "glm_flashes_10min": counts, "glm_score": scores,
+    })
+    return result, int(unit_count), int(success), f"GLM OK • {success} arquivos"
+
+
+
 def calcular_indice_holistico(df):
     p = np.clip(df["precipitation"].fillna(0).to_numpy(float), 0, None)
     pp = np.clip(df["precipitation_probability"].fillna(0).to_numpy(float), 0, 100)
@@ -219,10 +353,9 @@ def calcular_indice_holistico(df):
     cloud = np.clip(df["cloud_cover"].fillna(0).to_numpy(float), 0, 100)
     tprob = np.clip(df["thunderstorm_probability"].fillna(0).to_numpy(float), 0, 100)
     code = df["weather_code"].fillna(-1).to_numpy(float)
+    ld = np.clip(df["lightning_density"].fillna(0).to_numpy(float), 0, None)
+    glm = np.clip(df["glm_score"].fillna(0).to_numpy(float), 0, 100)
 
-    # Componente direta do Open-Meteo: probabilidade de trovoada.
-    s_prob = tprob
-    # Evidências do ambiente convectivo.
     s_showers = normalizar_0_1(showers, 0.2, 8.0) * 100
     s_cape = normalizar_0_1(cape, 100, 1800) * 100
     s_li = normalizar_0_1(-li, 0.0, 5.0) * 100
@@ -233,41 +366,58 @@ def calcular_indice_holistico(df):
     s_prec = normalizar_0_1(p, 0.3, 12) * 100
     s_code = np.where(np.isin(code.astype(int), [95, 96, 99]), 100.0, 0.0)
 
-    # Lightning density do IFS: escalonamento relativo logarítmico por hora/região.
-    ld = np.clip(df["lightning_density"].fillna(0).to_numpy(float), 0, None)
     density_score = np.zeros(len(df), dtype=float)
     if np.isfinite(ld).any() and np.nanmax(ld) > 0:
-        by_time = pd.Series(ld).groupby(df["tempo"]).transform(lambda s: max(float(np.nanpercentile(s, 95)), 1e-9)).to_numpy()
-        density_score = np.clip(np.log1p(ld) / np.log1p(np.maximum(by_time, 1e-9)) * 100, 0, 100)
+        by_time = pd.Series(ld).groupby(df["tempo"]).transform(
+            lambda s: max(float(np.nanpercentile(s, 95)), 1e-9)
+        ).to_numpy()
+        density_score = np.clip(
+            np.log1p(ld) / np.log1p(np.maximum(by_time, 1e-9)) * 100,
+            0, 100,
+        )
         density_score[ld <= 0] = 0
 
-    score = (
-        0.36 * s_prob
-        + 0.28 * density_score
-        + 0.10 * s_showers
-        + 0.08 * s_cape
-        + 0.05 * s_li
-        + 0.04 * s_pp
-        + 0.03 * s_rh
-        + 0.02 * s_cloud
-        + 0.02 * s_cin
-        + 0.02 * s_prec
+    model_score = (
+        0.35 * tprob +
+        0.25 * density_score +
+        0.10 * s_code +
+        0.08 * s_cape +
+        0.07 * s_showers +
+        0.04 * s_pp +
+        0.03 * s_rh +
+        0.02 * s_cloud +
+        0.03 * s_li +
+        0.03 * s_cin
     )
 
-    # Se a previsão do próprio Open-Meteo sinalizar trovoada (WMO 95/96/99),
-    # não deixar a combinação diluir esse sinal.
-    score = np.maximum(score, np.where(s_code > 0, 75 + 0.25 * s_prob, 0))
-    score = np.clip(score, 0, 100)
+    # GLM é usado como observação inicial e como memória de curto prazo para
+    # os próximos horários. Isso corrige o caso em que uma tempestade já está
+    # ocorrendo, mas a previsão numérica não acompanha imediatamente.
+    base_time = pd.Timestamp(df["tempo"].min())
+    lead_h = (pd.to_datetime(df["tempo"]) - base_time).dt.total_seconds().to_numpy() / 3600.0
+    glm_weight = 0.60 * np.exp(-np.maximum(lead_h, 0) / 1.5)
+    score = (1 - glm_weight) * model_score + glm_weight * glm
 
-    df = df.copy()
-    df["raios_score"] = score
-    df["raios_classe"] = np.select(
+    # Quando o GLM observa atividade muito forte no horário inicial, impõe-se
+    # um piso de intensidade para que a observação não seja diluída.
+    glm_counts = df["glm_flashes_10min"].fillna(0).to_numpy(float)
+    current = lead_h <= 0.51
+    score[current & (glm_counts >= 30)] = np.maximum(score[current & (glm_counts >= 30)], 90)
+    score[current & (glm_counts >= 15) & (glm_counts < 30)] = np.maximum(score[current & (glm_counts >= 15) & (glm_counts < 30)], 80)
+    score[current & (glm_counts >= 8) & (glm_counts < 15)] = np.maximum(score[current & (glm_counts >= 8) & (glm_counts < 15)], 65)
+    score[current & (glm_counts >= 4) & (glm_counts < 8)] = np.maximum(score[current & (glm_counts >= 4) & (glm_counts < 8)], 50)
+    score[current & (glm_counts >= 2) & (glm_counts < 4)] = np.maximum(score[current & (glm_counts >= 2) & (glm_counts < 4)], 35)
+    score[current & (glm_counts >= 1) & (glm_counts < 2)] = np.maximum(score[current & (glm_counts >= 1) & (glm_counts < 2)], 20)
+
+    score = np.clip(score, 0, 100)
+    out = df.copy()
+    out["raios_score"] = score
+    out["raios_classe"] = np.select(
         [score < 20, score < 40, score < 60, score < 80],
         ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"],
         default="MUITO ALTO",
     )
-    return df
-
+    return out
 
 def classe_cor(classe):
     return {
@@ -410,17 +560,36 @@ GLA, GLO = make_grid(ulat, ulon, halfspan)
 lats = tuple(GLA.ravel().tolist())
 lons = tuple(GLO.ravel().tolist())
 
-with st.spinner(f"CONSULTANDO OPEN-METEO PARA {len(lats)} PONTOS..."):
+with st.spinner(f"CONSULTANDO OPEN-METEO E GLM PARA {len(lats)} PONTOS..."):
     try:
         df = consultar_previsao(lats, lons)
         try:
-            raios_df = consultar_raios_ecmwf(lats, lons)
-            df = df.merge(raios_df, on=["lat", "lon", "tempo"], how="left")
+            ecmwf_df = consultar_raios_ecmwf(lats, lons)
+            df = df.merge(ecmwf_df, on=["lat", "lon", "tempo"], how="left")
         except Exception:
             df["lightning_density"] = np.nan
+        try:
+            gfs_df = consultar_trovoada_gfs(lats, lons)
+            df = df.merge(gfs_df, on=["lat", "lon", "tempo"], how="left")
+        except Exception:
+            df["thunderstorm_probability"] = np.nan
+
+        try:
+            glm_df, glm_unit_count, glm_files_ok, glm_status = consultar_glm_10min(
+                lats, lons, ulat, ulon
+            )
+            df = df.merge(glm_df, on=["lat", "lon"], how="left")
+        except Exception:
+            df["glm_flashes_10min"] = 0.0
+            df["glm_score"] = 0.0
+            glm_unit_count, glm_files_ok, glm_status = 0, 0, "GLM INDISPONÍVEL"
+
+        df["glm_flashes_10min"] = pd.to_numeric(df["glm_flashes_10min"], errors="coerce").fillna(0)
+        df["glm_score"] = pd.to_numeric(df["glm_score"], errors="coerce").fillna(0)
+        df["thunderstorm_probability"] = pd.to_numeric(df["thunderstorm_probability"], errors="coerce")
         df = calcular_indice_holistico(df)
     except Exception as exc:
-        st.error(f"ERRO AO CONSULTAR OPEN-METEO: {type(exc).__name__}: {exc}")
+        st.error(f"ERRO AO CONSULTAR OPEN-METEO/GLM: {type(exc).__name__}: {exc}")
         st.stop()
 
 # Tempos horários 0h ... +6h.
@@ -487,19 +656,23 @@ neighbor = fr[(fr["lat"].sub(ulat).abs() <= 1.0) & (fr["lon"].sub(ulon).abs() <=
 local_context = float(np.nanpercentile(neighbor["raios_score"], 80)) if np.isfinite(neighbor["raios_score"]).any() else float(unit_row["raios_score"])
 unit_score = 0.75 * float(unit_row["raios_score"]) + 0.25 * local_context
 unit_score = float(np.clip(unit_score, 0, 100))
-unit_class = np.select([unit_score < 20, unit_score < 40, unit_score < 60, unit_score < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO")
+unit_class = str(np.select([unit_score < 20, unit_score < 40, unit_score < 60, unit_score < 80], ["MUITO BAIXO", "BAIXO", "MODERADO", "ALTO"], default="MUITO ALTO"))
 
 st.subheader("CONDIÇÕES NA UNIDADE")
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("PRECIPITAÇÃO", f"{float(unit_row['precipitation']):.1f} MM/H")
 c2.metric("RAJADA", f"{float(unit_row['wind_gusts_10m']):.0f} KM/H")
-c3.metric("TROVOADA", f"{float(unit_row['thunderstorm_probability']):.0f}%")
-c4.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
+tp = unit_row['thunderstorm_probability']
+c3.metric("PROB. TROVOADA", "N/D" if pd.isna(tp) else f"{float(tp):.0f}%")
+c4.metric("RAIOS GLM • 10 MIN", f"{int(glm_unit_count)}")
+c5.metric("POTENCIAL DE RAIOS", f"{unit_score:.0f}/100")
 
 color = classe_cor(unit_class)
+
+st.caption(f"GLM: {glm_status} • {glm_files_ok} arquivos processados • janela dos últimos 10 min • raio local de 75 km")
 st.markdown(
     f'<div class="lightning-card"><div class="lightning-title">⚡ {unit_class} • POTENCIAL HOLÍSTICO</div>'
-    f'<div class="lightning-sub">O índice combina diretamente a probabilidade de trovoada do Open-Meteo, densidade de raios modelada pelo ECMWF via Open-Meteo e sinais convectivos como pancadas, CAPE, índice de levantamento, umidade e cobertura de nuvens.</div>'
+    f'<div class="lightning-sub">O índice combina previsão de trovoada do GFS, densidade de raios do ECMWF e sinais convectivos do Open-Meteo. Nos minutos mais recentes, o GLM do GOES-19 entra como observação para representar tempestades que já estão ocorrendo.</div>'
     f'<div class="legend-row">'
     f'<span class="legend-chip" style="background:#2E7D32">0–19 MUITO BAIXO</span>'
     f'<span class="legend-chip" style="background:#8BC34A">20–39 BAIXO</span>'
@@ -526,4 +699,4 @@ tabela = serie[["HORIZONTE", "TEMPO", "PRECIPITAÇÃO (MM/H)", "RAJADA (KM/H)", 
 st.dataframe(tabela, use_container_width=True, hide_index=True)
 st.download_button("⬇️ BAIXAR CSV", tabela.to_csv(index=False).encode("utf-8-sig"), "previsao_openmeteo_holistica.csv", "text/csv")
 
-st.caption("Fonte meteorológica: Open-Meteo. A densidade de raios é uma variável de modelo ECMWF disponibilizada pelo Open-Meteo; o indicador holístico não é uma observação de descargas em tempo real.")
+st.caption("Fonte de previsão: Open-Meteo (GFS/ECMWF). Observação recente de descargas: GLM/GOES-19. O indicador holístico combina previsão e observação recente; não é uma probabilidade estatística calibrada de raios.")
